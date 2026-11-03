@@ -15,7 +15,7 @@ use bevy::asset::{AssetEventSystems, AssetPath};
 use bevy::image::ImageLoaderSettings;
 use bevy::render::RenderSystems;
 use bevy::render::camera::ExtractedCamera;
-use bevy::sprite_render::{SpriteSystems, queue_material2d_meshes};
+use bevy::sprite_render::queue_material2d_meshes;
 use bevy::{
     core_pipeline::{
         core_2d::{AlphaMask2d, Opaque2d},
@@ -27,6 +27,7 @@ use bevy::{
         system::{SystemParamItem, lifetimeless::*},
     },
     math::{Affine3A, FloatOrd},
+    mesh::Mesh2d,
     platform::collections::HashMap,
     prelude::*,
     render::{
@@ -242,11 +243,10 @@ impl Plugin for SpritesPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             PostUpdate,
-            ((
+            (
                 compute_slices_on_asset_event.before(AssetEventSystems),
                 compute_slices_on_sprite_change,
-            )
-                .in_set(SpriteSystems::ComputeSlices),),
+            ),
         );
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
@@ -265,7 +265,7 @@ impl Plugin for SpritesPlugin {
                         sort_phase_system::<SpritePhase>.in_set(RenderSystems::PhaseSort),
                         queue_sprites
                             .in_set(RenderSystems::Queue)
-                            .ambiguous_with(queue_material2d_meshes::<ColorMaterial>),
+                            .ambiguous_with(queue_material2d_meshes),
                         sort_binned_render_phase::<Opaque2d>.in_set(RenderSystems::PhaseSort),
                         sort_binned_render_phase::<AlphaMask2d>.in_set(RenderSystems::PhaseSort),
                     ),
@@ -309,10 +309,14 @@ fn queue_sprites(
         let mut view_key = SpritePipelineKey::from_target_format(view.target_format) | msaa_key;
 
         if !camera.hdr {
-            if let Some(tonemapping) = tonemapping {
+            if let Some(tonemapping) = tonemapping
+                && tonemapping.is_enabled()
+            {
                 view_key |= SpritePipelineKey::TONEMAP_IN_SHADER;
                 view_key |= match tonemapping {
-                    Tonemapping::None => SpritePipelineKey::TONEMAP_METHOD_NONE,
+                    Tonemapping::None | Tonemapping::Linear => {
+                        SpritePipelineKey::TONEMAP_METHOD_LINEAR
+                    }
                     Tonemapping::Reinhard => SpritePipelineKey::TONEMAP_METHOD_REINHARD,
                     Tonemapping::ReinhardLuminance => {
                         SpritePipelineKey::TONEMAP_METHOD_REINHARD_LUMINANCE
@@ -339,7 +343,10 @@ fn queue_sprites(
         let pipeline = pipelines.specialize(&pipeline_cache, &pipeline, view_key);
 
         view_entities.clear();
-        if let Some(visible_entities) = visible_entities.get::<Sprite>() {
+        // Since Bevy 0.20 sprites render through `Mesh2d`, which is the visibility class they're
+        // registered under. Entities that aren't sprites are skipped below, since only sprites
+        // were extracted.
+        if let Some(visible_entities) = visible_entities.get::<Mesh2d>() {
             view_entities.extend(
                 visible_entities
                     .iter_visible()

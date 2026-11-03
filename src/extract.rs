@@ -13,7 +13,6 @@ use bevy::{
         view::{NoIndirectDrawing, RetainedViewEntity},
     },
     sprite::Anchor,
-    sprite_render::SpriteSystems,
 };
 
 use crate::{
@@ -39,7 +38,7 @@ use crate::{
 pub struct ExtractPlugin;
 impl Plugin for ExtractPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(ExtractComponentPlugin::<FireflyConfig>::default());
+        app.add_plugins(ExtractComponentPlugin::<FireflyConfig, RenderApp>::default());
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -48,7 +47,7 @@ impl Plugin for ExtractPlugin {
             ExtractSchedule,
             (
                 extract_camera_phases,
-                extract_sprites.in_set(SpriteSystems::ExtractSprites),
+                extract_sprites,
                 extract_sprite_events,
                 extract_world_data,
                 extract_lights,

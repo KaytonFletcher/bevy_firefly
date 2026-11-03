@@ -1,13 +1,9 @@
-#define_import_path firefly::types
-
-
-#import bevy_render::view::View
+import bevy_render::view::View;
 
 @group(0) @binding(0) var<uniform> view: View;
 
-@group(0) @binding(1) var dt_lut_texture: texture_3d<f32>;
-
-@group(0) @binding(2) var dt_lut_sampler: sampler;
+// Bindings 1 and 2 of group 0 hold the tonemapping LUT. Bevy's tonemapping module declares them
+// itself (bevy_core_pipeline::tonemapping::lut_bindings), so they aren't redeclared here.
 
 struct PointLight {
     pos: vec2<f32>,

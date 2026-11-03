@@ -3,9 +3,9 @@
 use bevy::{
     camera::visibility::{RenderLayers, VisibilityClass, add_visibility_class},
     color::palettes::css::BLACK,
-    math::bounding::{Aabb2d, BoundingVolume},
     prelude::*,
     render::{render_resource::ShaderType, sync_world::SyncToRenderWorld},
+    shape::{Aabb2d, BoundingVolume},
 };
 use bytemuck::{NoUninit, Pod, Zeroable};
 use core::f32;

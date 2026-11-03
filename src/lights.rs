@@ -1,5 +1,8 @@
 use bevy::{
-    camera::visibility::{RenderLayers, VisibilityClass, add_visibility_class},
+    camera::{
+        CompositingSpace,
+        visibility::{RenderLayers, VisibilityClass, add_visibility_class},
+    },
     color::palettes::css::WHITE,
     core_pipeline::tonemapping::{DebandDither, Tonemapping},
     ecs::{
@@ -25,7 +28,10 @@ use bevy::{
             BindGroup, PipelineCache, ShaderType, SpecializedRenderPipelines, StorageBuffer,
         },
         sync_world::SyncToRenderWorld,
-        view::{ExtractedView, RenderVisibleEntities, RetainedViewEntity, ViewUniformOffset},
+        view::{
+            ExtractedView, RenderVisibleEntities, ResolvedCompositingSpace, RetainedViewEntity,
+            ViewUniformOffset,
+        },
     },
 };
 use bytemuck::NoUninit;
@@ -372,12 +378,23 @@ fn queue_lights(
         Option<&Tonemapping>,
         Option<&DebandDither>,
         Option<&ExtractedCombineLightmapTo>,
+        Option<&ResolvedCompositingSpace>,
     )>,
     pipeline_cache: Res<PipelineCache>,
 ) {
     let draw_lightmap_function = light_draw_functions.read().id::<DrawLightmap>();
 
-    for (view, camera, visible_entities, msaa, tonemapping, dither, combined_lightmap) in &views {
+    for (
+        view,
+        camera,
+        visible_entities,
+        msaa,
+        tonemapping,
+        dither,
+        combined_lightmap,
+        compositing_space,
+    ) in &views
+    {
         let Some(lightmap_phase) = lightmap_phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
@@ -392,24 +409,21 @@ fn queue_lights(
         let msaa_key = LightPipelineKey::from_msaa_samples(msaa.samples());
         let mut view_key = LightPipelineKey::from_target_format(target_format) | msaa_key;
 
-        if camera
-            .compositing_space
-            .is_some_and(|s| s == CompositingSpace::Srgb)
-        {
-            view_key |= LightPipelineKey::SRGB_COMPOSITING;
-        }
-        if camera
-            .compositing_space
-            .is_some_and(|s| s == CompositingSpace::Oklab)
-        {
-            view_key |= LightPipelineKey::OKLAB_COMPOSITING;
+        match ResolvedCompositingSpace::space(compositing_space) {
+            Some(CompositingSpace::Srgb) => view_key |= LightPipelineKey::SRGB_COMPOSITING,
+            Some(CompositingSpace::Oklab) => view_key |= LightPipelineKey::OKLAB_COMPOSITING,
+            Some(CompositingSpace::Linear) | None => {}
         }
 
         if !camera.hdr {
-            if let Some(tonemapping) = tonemapping {
+            if let Some(tonemapping) = tonemapping
+                && tonemapping.is_enabled()
+            {
                 view_key |= LightPipelineKey::TONEMAP_IN_SHADER;
                 view_key |= match tonemapping {
-                    Tonemapping::None => LightPipelineKey::TONEMAP_METHOD_NONE,
+                    Tonemapping::None | Tonemapping::Linear => {
+                        LightPipelineKey::TONEMAP_METHOD_LINEAR
+                    }
                     Tonemapping::Reinhard => LightPipelineKey::TONEMAP_METHOD_REINHARD,
                     Tonemapping::ReinhardLuminance => {
                         LightPipelineKey::TONEMAP_METHOD_REINHARD_LUMINANCE
