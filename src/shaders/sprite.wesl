@@ -1,17 +1,10 @@
-enable f16;
+import bevy_render::maths::affine3_to_square;
 
-#ifdef TONEMAP_IN_SHADER
-#import bevy_core_pipeline::tonemapping
-#endif
+import bevy_sprite_render::render::sprite_view_bindings::view;
 
-#import bevy_render::{
-    maths::affine3_to_square,
-    view::View,
-}
-
-#import firefly::types::SpriteId
-
-#import bevy_sprite::sprite_view_bindings::view
+// The value 0.1 takes once stored in the Rgba16Float normal map, i.e. `f32(f16(0.1))`.
+// Written out so the shader doesn't need the `shader-f16` feature.
+const NORMAL_DUMMY_B: f32 = 0.0999755859375;
 
 struct VertexInput {
     @builtin(vertex_index) index: u32,
@@ -84,7 +77,7 @@ fn fragment(in: VertexOutput) -> FragmentOutput {
 
     if color.a >= 1.0 {
         if normal_dummy == 1 {
-            res.normal = vec4<f32>(0, 0, f32(f16(0.1)), 1.0);
+            res.normal = vec4<f32>(0, 0, NORMAL_DUMMY_B, 1.0);
         }
         else {
             res.normal = normal;

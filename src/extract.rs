@@ -13,7 +13,6 @@ use bevy::{
         view::{NoIndirectDrawing, RetainedViewEntity},
     },
     sprite::Anchor,
-    sprite_render::SpriteSystems,
 };
 
 use crate::{
@@ -48,7 +47,7 @@ impl Plugin for ExtractPlugin {
             ExtractSchedule,
             (
                 extract_camera_phases,
-                extract_sprites.in_set(SpriteSystems::ExtractSprites),
+                extract_sprites,
                 extract_sprite_events,
                 extract_world_data,
                 extract_lights,

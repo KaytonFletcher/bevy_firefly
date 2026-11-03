@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  # The examples CI builds and runs. `noise` is left out: it still targets the render graph
+  # API that Bevy 0.19 removed.
+  EXAMPLES: simple shapes crates flashlight blending fov render_layers grid_stress stress test
+
+jobs:
+  # Build the crate and its examples. Each compiler message becomes a GitHub annotation.
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy
+
+      - name: Install build dependencies
+        run: sudo apt-get update; sudo apt-get install --no-install-recommends libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: |
+          set -o pipefail
+          args=(--lib)
+          for example in $EXAMPLES; do args+=(--example "$example"); done
+          cargo clippy "${args[@]}" --all-features --message-format=short --color=never 2>&1 \
+            | sed -E \
+              -e 's/^([^: ]+):([0-9]+):([0-9]+): (error|warning)(\[[^]]*\])?: (.*)$/::\4 file=\1,line=\2,col=\3::\6/' \
+              -e 's/^(error(\[[^]]*\])?: .*)$/::error::\1/' \
+              -e 's/^(.*panicked at .*)$/::error::\1/'
+
+  # Render a few examples on a software Vulkan driver (llvmpipe), so shader and pipeline errors
+  # show up in CI, and compare them against the golden images in .github/ci/golden.
+  #
+  # The `baseline` leg renders the same examples from `main`, for comparing a change with the
+  # code it replaces. Each leg pushes its screenshots, logs and diff images to a branch:
+  # `ci-screenshots` for this commit and `ci-screenshots-main` for main.
+  render:
+    name: Render examples (${{ matrix.leg }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [head, baseline]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Keep this commit's .github (CI config, golden images) but build main's code.
+      - name: Check out main's code
+        if: matrix.leg == 'baseline'
+        run: |
+          git checkout origin/main -- Cargo.toml src examples assets
+          git log -1 --format='Baseline: %h %s' origin/main
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: render-${{ matrix.leg }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev \
+            libxkbcommon-x11-0 libxcb-xfixes0-dev xvfb libgl1-mesa-dri mesa-vulkan-drivers
+          python3 -m pip install --user --break-system-packages pillow numpy
+
+      - name: Build examples
+        run: |
+          args=()
+          for example in simple shapes crates; do args+=(--example "$example"); done
+          cargo build "${args[@]}" --features bevy/bevy_ci_testing 2>&1 \
+            | sed -E 's/^(error(\[[^]]*\])?: .*)$/::error::\1/'
+
+      - name: Run examples
+        run: |
+          set +e
+          mkdir -p screenshots logs
+          failed=0
+          for example in simple shapes crates; do
+            echo "::group::$example"
+            CI_TESTING_CONFIG=.github/ci/screenshot.ron timeout 600 xvfb-run -a \
+              cargo run --example "$example" --features bevy/bevy_ci_testing > "logs/$example.log" 2>&1
+            status=$?
+            sed -i 's/\x1b\[[0-9;]*m//g' "logs/$example.log"
+            cat "logs/$example.log"
+            echo "::endgroup::"
+            if [ $status -ne 0 ]; then
+              echo "::error::$example exited with status $status"
+              failed=1
+            fi
+            grep -E " ERROR |panicked" "logs/$example.log" | head -20 | while IFS= read -r line; do
+              echo "::error::$example: ${line:0:900}"
+            done
+            if grep -qE " ERROR |panicked" "logs/$example.log"; then failed=1; fi
+            for shot in screenshot-*.png; do
+              [ -e "$shot" ] && mv "$shot" "screenshots/$example.png"
+            done
+            if [ ! -e "screenshots/$example.png" ]; then
+              echo "::error::$example produced no screenshot"
+              failed=1
+            fi
+          done
+          exit $failed
+
+      - name: Compare with golden images
+        if: matrix.leg == 'head'
+        run: python3 .github/ci/compare_screenshots.py screenshots .github/ci/golden
+
+      - name: Push screenshots
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ matrix.leg == 'baseline' && 'ci-screenshots-main' || 'ci-screenshots' }}
+        run: |
+          [ -d screenshots ] || exit 0
+          cp -r logs screenshots/ 2>/dev/null || true
+          cd screenshots
+          git init -q
+          git checkout -q -b "$BRANCH"
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Screenshots (${{ matrix.leg }}) for ${{ github.event.pull_request.head.sha || github.sha }}"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "$BRANCH"

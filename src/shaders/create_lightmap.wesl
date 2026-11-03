@@ -1,23 +1,23 @@
-enable f16;
+import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput;
 
-#import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
-#import bevy_render::view::View
+@if(TONEMAP_IN_SHADER)
+import bevy_core_pipeline::tonemapping;
 
-#ifdef TONEMAP_IN_SHADER
-#import bevy_core_pipeline::tonemapping
-#endif
-
-#import firefly::types::{
-    view, PointLight, LightingData, PolyOccluder, RoundOccluder, OccluderPointer, 
+import package::shaders::types::{
+    view, PointLight, PolyOccluder, RoundOccluder, OccluderPointer,
     FireflyConfig, BinIndices, N_BINS,
-}
+};
 
-#import firefly::utils::{
-    ndc_to_world, frag_coord_to_ndc, orientation, same_orientation, intersect, blend, 
+import package::shaders::utils::{
+    ndc_to_world, frag_coord_to_ndc, orientation, same_orientation, intersect, blend,
     shadow_blend, intersects_arc, rotate, rotate_arctan, between_arctan, distance_point_to_line,
     intersection_point, rect_intersection, rect_line_intersection, intersects_axis_edge, intersects_corner_arc,
-    rotate_90, rotate_90_cc, intersects_half, falloff
-}
+    rotate_90, rotate_90_cc, intersects_half, falloff,
+};
+
+// The value 0.1 takes once stored in the Rgba16Float normal map, i.e. `f32(f16(0.1))`.
+// Written out so the shader doesn't need the `shader-f16` feature.
+const NORMAL_DUMMY_B: f32 = 0.0999755859375;
 
 @group(1) @binding(0)
 var texture_sampler: sampler;
@@ -77,9 +77,8 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4f {
 
     var light_color = light.color;
 
-#ifdef TONEMAP_IN_SHADER
+@if(TONEMAP_IN_SHADER)
     light_color = tonemapping::tone_mapping(light_color, view.color_grading);
-#endif
 
     // light_color = pow(light_color, vec4<f32>(2.2));
 
@@ -117,7 +116,7 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4f {
             }
         }; 
 
-        if normal.b == f32(f16(0.1)) {
+        if normal.b == NORMAL_DUMMY_B {
             normal_multi = 1.0;
         }
 

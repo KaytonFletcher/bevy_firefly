@@ -1,6 +1,4 @@
-#define_import_path firefly::utils
-
-#import firefly::types::view
+import package::shaders::types::view;
 
 fn world_to_ndc(world_position: vec2<f32>) -> vec2<f32> {
     return (view.clip_from_world * vec4(world_position, 0.0, 1.0)).xy;

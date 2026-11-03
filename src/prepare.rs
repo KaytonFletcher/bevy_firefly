@@ -26,10 +26,7 @@ use crate::{
 use bevy::{
     camera::visibility::RenderLayers,
     core_pipeline::tonemapping::{Tonemapping, TonemappingLuts, get_lut_bindings},
-    math::{
-        Affine3A,
-        bounding::{Aabb2d, IntersectsVolume},
-    },
+    math::Affine3A,
     platform::{
         collections::{HashMap, HashSet},
         hash::FixedHasher,
@@ -47,6 +44,7 @@ use bevy::{
         texture::{FallbackImage, GpuImage, TextureCache},
         view::{ExtractedView, RetainedViewEntity, ViewTarget, ViewUniforms},
     },
+    shape::{Aabb2d, IntersectsVolume},
     tasks::{ComputeTaskPool, ParallelSliceMut},
 };
 
