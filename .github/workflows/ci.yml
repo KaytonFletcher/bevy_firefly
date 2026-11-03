@@ -50,29 +50,46 @@ jobs:
               -e 's/^(error(\[[^]]*\])?: .*)$/::error::\1/' \
               -e 's/^(.*panicked at .*)$/::error::\1/'
 
-  # Render a few examples on a software Vulkan driver, so shader and pipeline errors show up in CI.
-  # Each `ERROR` log line becomes an annotation, and the screenshots are pushed to the
-  # `ci-screenshots` branch.
+  # Render a few examples on a software Vulkan driver (llvmpipe), so shader and pipeline errors
+  # show up in CI, and compare them against the golden images in .github/ci/golden.
+  #
+  # The `baseline` leg renders the same examples from `main`, for comparing a change with the
+  # code it replaces. Each leg pushes its screenshots, logs and diff images to a branch:
+  # `ci-screenshots` for this commit and `ci-screenshots-main` for main.
   render:
-    name: Render examples
+    name: Render examples (${{ matrix.leg }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [head, baseline]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Keep this commit's .github (CI config, golden images) but build main's code.
+      - name: Check out main's code
+        if: matrix.leg == 'baseline'
+        run: |
+          git checkout origin/main -- Cargo.toml src examples assets
+          git log -1 --format='Baseline: %h %s' origin/main
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: render
+          shared-key: render-${{ matrix.leg }}
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev \
             libxkbcommon-x11-0 libxcb-xfixes0-dev xvfb libgl1-mesa-dri mesa-vulkan-drivers
+          python3 -m pip install --user --break-system-packages pillow numpy
 
       - name: Build examples
         run: |
@@ -102,9 +119,6 @@ jobs:
               echo "::error::$example: ${line:0:900}"
             done
             if grep -qE " ERROR |panicked" "logs/$example.log"; then failed=1; fi
-            grep -E " WARN " "logs/$example.log" | head -10 | while IFS= read -r line; do
-              echo "::warning::$example: ${line:0:900}"
-            done
             for shot in screenshot-*.png; do
               [ -e "$shot" ] && mv "$shot" "screenshots/$example.png"
             done
@@ -115,18 +129,23 @@ jobs:
           done
           exit $failed
 
+      - name: Compare with golden images
+        if: matrix.leg == 'head'
+        run: python3 .github/ci/compare_screenshots.py screenshots .github/ci/golden
+
       - name: Push screenshots
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ matrix.leg == 'baseline' && 'ci-screenshots-main' || 'ci-screenshots' }}
         run: |
           [ -d screenshots ] || exit 0
           cp -r logs screenshots/ 2>/dev/null || true
           cd screenshots
           git init -q
-          git checkout -q -b ci-screenshots
+          git checkout -q -b "$BRANCH"
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
           git add -A
-          git commit -q -m "Screenshots for ${{ github.sha }} (${{ github.event.pull_request.head.sha || github.sha }})"
-          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" ci-screenshots
+          git commit -q -m "Screenshots (${{ matrix.leg }}) for ${{ github.event.pull_request.head.sha || github.sha }}"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "$BRANCH"
