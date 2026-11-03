@@ -181,7 +181,7 @@ pub(crate) struct ImageBindGroups {
 /// Manual image loading:
 ///
 /// ```
-/// let image: Handle<Image> = asset_server.load_with_settings("some_sprite_normal.png", |x: &mut ImageLoaderSettings| x.is_srgb = false);
+/// let image: Handle<Image> = asset_server.load_builder().with_settings(|x: &mut ImageLoaderSettings| x.is_srgb = false).load("some_sprite_normal.png");
 ///
 /// commands.spawn((
 ///     Sprite::from_image(asset_server.load("some_sprite.png")),
@@ -217,8 +217,10 @@ impl NormalMap {
     ///
     /// You can use [`.handle()`](NormalMap::handle) to get the resulting image handle.
     pub fn from_file<'a>(path: impl Into<AssetPath<'a>>, asset_server: &AssetServer) -> Self {
-        let image: Handle<Image> =
-            asset_server.load_with_settings(path, |x: &mut ImageLoaderSettings| x.is_srgb = false);
+        let image: Handle<Image> = asset_server
+            .load_builder()
+            .with_settings(|x: &mut ImageLoaderSettings| x.is_srgb = false)
+            .load(path);
 
         Self { image }
     }
@@ -226,7 +228,7 @@ impl NormalMap {
     /// Construct a new [NormalMap] from an image handle. It's important that this image is loaded without gamma correction:
     ///
     /// ```
-    /// let image: Handle<Image> = asset_server.load_with_settings(path, |x: &mut ImageLoaderSettings| x.is_srgb = false);
+    /// let image: Handle<Image> = asset_server.load_builder().with_settings(|x: &mut ImageLoaderSettings| x.is_srgb = false).load(path);
     /// ```
     ///
     /// You can use the [`from_file`](NormalMap::from_file) constructor to handle this automatically for you, and later grab the handle

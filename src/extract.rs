@@ -38,7 +38,7 @@ use crate::{
 pub struct ExtractPlugin;
 impl Plugin for ExtractPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(ExtractComponentPlugin::<FireflyConfig, RenderApp>::default());
+        app.add_plugins(ExtractComponentPlugin::<FireflyConfig>::default());
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
