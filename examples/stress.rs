@@ -69,7 +69,7 @@ fn main() {
         Update,
         update_commands.run_if(
             resource_exists_and_changed::<LogDiagnosticsStatus>
-                .or(resource_exists_and_changed::<LogDiagnosticsFilters>),
+                .or_else(resource_exists_and_changed::<LogDiagnosticsFilters>),
         ),
     );
 
