@@ -3,11 +3,12 @@
 Usage: bench.py BASE_SHA OUT_DIR
 
 For each commit after BASE_SHA, starting at the one that adds this script, this builds that commit's `src` with this checkout's examples,
-then:
-- runs the timed bench scenes and records frame time, GPU pass time and firefly system CPU time,
-- renders the screenshot-only bench scenes and the examples in REGRESSION_EXAMPLES.
+then renders the screenshot-only bench scenes and the examples in REGRESSION_EXAMPLES.
+After every commit is built, it runs the timed bench scenes for all commits in BENCH_ROUNDS
+interleaved rounds, so runner drift hits every commit alike, and reports the median and range.
 
 The first commit is the reference: every later commit's images must match it exactly.
+An image that differs is rendered twice more, to tell a flaky example from a real change.
 Results go to OUT_DIR/<short sha>/ and a markdown summary to OUT_DIR/summary.md.
 """
 
@@ -29,6 +30,8 @@ REGRESSION_EXAMPLES = ["simple", "shapes", "crates", "flashlight", "blending", "
 FEATURES = "bevy/bevy_ci_testing,bevy/trace_chrome"
 TARGET = Path("target/release/examples")
 SCREENSHOT_CONFIG = Path(".github/ci/screenshot.ron").resolve()
+ROUNDS = int(os.environ.get("BENCH_ROUNDS", "5"))
+RETRIES = 2
 
 
 def run(cmd, **kwargs):
@@ -86,10 +89,29 @@ def compare(a, b):
     return int((delta > 0).sum()), int(delta.max())
 
 
-def bench_commit(sha, out):
+def render_example(example, out):
+    work = out / f"run-{example}"
+    work.mkdir(exist_ok=True)
+    status, errors = xvfb(
+        [(TARGET / example).resolve()],
+        {"CI_TESTING_CONFIG": str(SCREENSHOT_CONFIG), "TRACE_CHROME": str(work / "trace.json")},
+        out / f"{example}.log",
+        cwd=work,
+    )
+    errors = [f"{example}: {e}" for e in errors[:5]]
+    if status != 0:
+        errors.append(f"{example} exited with {status}")
+    for shot in work.glob("screenshot-*.png"):
+        shot.rename(out / f"{example}.png")
+    shutil.rmtree(work)
+    return errors
+
+
+def bench_commit(sha, out, ref):
+    """Builds `sha` and renders its check images. `ref` is the reference commit's dir, if any."""
     out.mkdir(parents=True, exist_ok=True)
     run(["git", "checkout", "-q", sha, "--", "src", "Cargo.toml"])
-    result = {"sha": sha, "subject": git("log", "-1", "--format=%s", sha), "scenes": {}, "errors": []}
+    result = {"sha": sha, "subject": git("log", "-1", "--format=%s", sha), "scenes": {}, "errors": [], "flaky": {}}
 
     examples = sorted(set(["bench", *REGRESSION_EXAMPLES]))
     args = [a for e in examples for a in ("--example", e)]
@@ -98,89 +120,142 @@ def bench_commit(sha, out):
     except subprocess.CalledProcessError:
         result["errors"].append("build failed")
         return result
+    shutil.copy(TARGET / "bench", out / "bench-bin")
 
-    for scene in TIMED_SCENES + CHECK_SCENES:
-        timed = scene in TIMED_SCENES
+    for scene in CHECK_SCENES:
         env = {
             "FIREFLY_BENCH_SCENE": scene,
             "FIREFLY_BENCH_OUT": str(out / f"{scene}.json"),
             "FIREFLY_BENCH_SCREENSHOT": str(out / f"bench-{scene}.png"),
-            "TRACE_CHROME": str(out / f"trace-{scene}.json"),
+            "FIREFLY_BENCH_WARMUP": "3",
+            "FIREFLY_BENCH_FRAMES": "3",
         }
-        if not timed:
-            env |= {"FIREFLY_BENCH_WARMUP": "3", "FIREFLY_BENCH_FRAMES": "3"}
-        status, errors = xvfb([TARGET / "bench"], env, out / f"bench-{scene}.log")
+        status, errors = xvfb([out / "bench-bin"], env, out / f"bench-{scene}.log")
         result["errors"] += [f"bench {scene}: {e}" for e in errors[:5]]
         if status != 0:
             result["errors"].append(f"bench {scene} exited with {status}")
-            continue
-        if timed:
-            data = json.loads((out / f"{scene}.json").read_text())
-            data["systems_ms"] = system_times(out / f"trace-{scene}.json")
-            result["scenes"][scene] = data
-        (out / f"trace-{scene}.json").unlink(missing_ok=True)
 
     for example in REGRESSION_EXAMPLES:
-        work = out / f"run-{example}"
-        work.mkdir(exist_ok=True)
-        status, errors = xvfb(
-            [(TARGET / example).resolve()],
-            {"CI_TESTING_CONFIG": str(SCREENSHOT_CONFIG), "TRACE_CHROME": str(work / "trace.json")},
-            out / f"{example}.log",
-            cwd=work,
-        )
-        result["errors"] += [f"{example}: {e}" for e in errors[:5]]
-        if status != 0:
-            result["errors"].append(f"{example} exited with {status}")
-        for shot in work.glob("screenshot-*.png"):
-            shot.rename(out / f"{example}.png")
-        shutil.rmtree(work)
+        result["errors"] += render_example(example, out)
+        image, ref_image = out / f"{example}.png", ref and ref / f"{example}.png"
+        if not (ref_image and ref_image.exists() and image.exists()) or compare(ref_image, image) == (0, 0):
+            continue
+        # Render again: if a retry matches, the example is nondeterministic, not changed.
+        first = image.with_suffix(".first.png")
+        image.rename(first)
+        diffs = []
+        for _ in range(RETRIES):
+            render_example(example, out)
+            diffs.append(image.exists() and compare(ref_image, image) != (0, 0))
+        if not all(diffs):
+            result["flaky"][example] = f"{sum(diffs) + 1}/{RETRIES + 1} renders differ"
+        else:
+            first.replace(image)
+        first.unlink(missing_ok=True)
 
-    (out / "result.json").write_text(json.dumps(result, indent=2))
     return result
 
 
-def fmt(value, ref=None):
-    if value is None:
+def time_commits(results, out):
+    """Runs every timed scene for every built commit, ROUNDS times, alternating commits."""
+    rounds = {}
+    for r in range(ROUNDS):
+        for res in results:
+            dir = out / res["sha"][:8]
+            if not (dir / "bench-bin").exists():
+                continue
+            for scene in TIMED_SCENES:
+                env = {
+                    "FIREFLY_BENCH_SCENE": scene,
+                    "FIREFLY_BENCH_OUT": str(dir / f"{scene}.json"),
+                    "FIREFLY_BENCH_SCREENSHOT": str(dir / (f"bench-{scene}.png" if r == 0 else "discard.png")),
+                    "TRACE_CHROME": str(dir / f"trace-{scene}.json"),
+                }
+                status, errors = xvfb([dir / "bench-bin"], env, dir / f"bench-{scene}.log")
+                if r == 0:
+                    res["errors"] += [f"bench {scene}: {e}" for e in errors[:5]]
+                if status != 0:
+                    res["errors"].append(f"bench {scene} round {r} exited with {status}")
+                    continue
+                data = json.loads((dir / f"{scene}.json").read_text())
+                diag = data.get("diagnostics_median", {})
+                systems = system_times(dir / f"trace-{scene}.json")
+                (dir / f"trace-{scene}.json").unlink(missing_ok=True)
+                for key, value in metrics(data["frame_ms_median"], diag, systems).items():
+                    rounds.setdefault((res["sha"], scene, key), []).append(value)
+    for res in results:
+        for name in ("discard.png", "bench-bin"):
+            (out / res["sha"][:8] / name).unlink(missing_ok=True)
+        for scene in TIMED_SCENES:
+            values = {k: rounds.get((res["sha"], scene, k)) for k in METRICS}
+            if values["frame"]:
+                res["scenes"][scene] = values
+        (out / res["sha"][:8] / "result.json").write_text(json.dumps(res, indent=2))
+
+
+METRICS = ["frame", "gpu", "invocations", "prepare_data", "systems"]
+
+
+def metrics(frame, diag, systems):
+    invocations = diag.get("render/firefly_lightmap/fragment_shader_invocations")
+    return {
+        "frame": frame,
+        "gpu": diag.get("render/firefly_lightmap/elapsed_gpu"),
+        "invocations": invocations and invocations / 1e6,
+        "prepare_data": next((v for k, v in systems.items() if k.endswith("prepare_data")), None),
+        "systems": sum(systems.values()) if systems else None,
+    }
+
+
+def cell(values, prev):
+    """Median, then the change from the previous commit. `~` marks a change within run-to-run
+    spread: the two commits' ranges across rounds overlap."""
+    values = [v for v in values or [] if v is not None]
+    if not values:
         return "–"
-    if ref in (None, 0):
-        return f"{value:.2f}"
-    return f"{value:.2f} ({(value - ref) / ref * 100:+.0f}%)"
+    med = statistics.median(values)
+    text = f"{med:.2f}"
+    prev = [v for v in prev or [] if v is not None]
+    if prev and statistics.median(prev):
+        p = statistics.median(prev)
+        noise = len(values) > 1 and min(values) <= max(prev) and min(prev) <= max(values)
+        text += f" ({(med - p) / p * 100:+.0f}%{' ~' if noise else ''})"
+    return text
 
 
 def summary(results, out):
     ref, lines = results[0], ["# Firefly benchmark", ""]
     lines.append(f"Reference commit: `{ref['sha'][:8]}` {ref['subject']}")
     lines.append("")
-    lines.append("Times are medians in ms. Percentages compare with the reference commit.")
+    lines.append(
+        f"Medians in ms over {ROUNDS} rounds. Percentages compare each commit with the one before it; "
+        "`~` means the two commits' ranges overlap, so the change is within noise. "
+        "Frame range is min–max across rounds."
+    )
 
     for scene in TIMED_SCENES:
         lines += ["", f"## {scene}", ""]
         lines.append(
-            "| Commit | Frame | Lightmap GPU | Lightmap fragment invocations (M) "
+            "| Commit | Frame | Frame range | Lightmap GPU | Lightmap fragment invocations (M) "
             "| `prepare_data` CPU | All firefly systems CPU |"
         )
-        lines.append("|---|---|---|---|---|---|")
-        base = ref["scenes"].get(scene, {})
-
-        def metrics(data):
-            diag = data.get("diagnostics_median", {})
-            systems = data.get("systems_ms", {})
-            return [
-                data.get("frame_ms_median"),
-                diag.get("render/firefly_lightmap/elapsed_gpu"),
-                (lambda v: v and v / 1e6)(diag.get("render/firefly_lightmap/fragment_shader_invocations")),
-                next((v for k, v in systems.items() if k.endswith("prepare_data")), None),
-                sum(systems.values()) if systems else None,
-            ]
-
+        lines.append("|---|---|---|---|---|---|---|")
+        prev = None
         for r in results:
             data = r["scenes"].get(scene)
             if data is None:
-                lines.append(f"| `{r['sha'][:8]}` {r['subject']} | failed | | | | |")
+                lines.append(f"| `{r['sha'][:8]}` {r['subject']} | failed | | | | | |")
                 continue
-            cells = [fmt(v, b) for v, b in zip(metrics(data), metrics(base))]
+            cells = [cell(data[k], prev and prev[k]) for k in METRICS]
+            frames = data["frame"]
+            cells.insert(1, f"{min(frames):.0f}–{max(frames):.0f}")
             lines.append(f"| `{r['sha'][:8]}` {r['subject']} | " + " | ".join(cells) + " |")
+            prev = data
+        first, last = ref["scenes"].get(scene), results[-1]["scenes"].get(scene)
+        if first and last and first is not last:
+            total = [cell(last[k], first[k]) for k in METRICS]
+            total.insert(1, "")
+            lines.append("| **Total, last vs reference** | " + " | ".join(total) + " |")
 
     lines += ["", "## Output compared with the reference commit", ""]
     images = sorted(p.name for p in (out / ref["sha"][:8]).glob("*.png"))
@@ -205,6 +280,11 @@ def summary(results, out):
                 failed |= changed > 0
         lines.append(f"| `{r['sha'][:8]}` | " + " | ".join(cells) + " |")
 
+    flaky = [f"{r['sha'][:8]} {ex}: {why}" for r in results for ex, why in r["flaky"].items()]
+    if flaky:
+        lines += ["", "## Flaky examples", "", "A retry matched the reference, so these don't fail the run.", ""]
+        lines += [f"- {f}" for f in flaky]
+
     errors = [e for r in results for e in r["errors"]]
     if errors:
         failed = True
@@ -222,8 +302,11 @@ def main():
     # Earlier commits lack the timing spans the bench reads.
     first = git("rev-list", "--reverse", f"{base}..HEAD", "--", ".github/ci/bench.py").split()[0]
     commits = commits[commits.index(first) :]
-    results = [bench_commit(sha, out / sha[:8]) for sha in commits]
+    results = []
+    for sha in commits:
+        results.append(bench_commit(sha, out / sha[:8], results and out / results[0]["sha"][:8]))
     run(["git", "checkout", "-q", "HEAD", "--", "src", "Cargo.toml"])
+    time_commits(results, out)
     return 1 if summary(results, out) else 0
 
 
