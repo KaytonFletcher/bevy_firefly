@@ -23,9 +23,8 @@ var texture_sampler: sampler;
 @group(1) @binding(1)
 var<storage> lights: array<PointLight>;
 
-// The light being drawn, and the start of its block in `bins`.
-// Set at the start of both entry points, from the instance index.
-var<private> light_index: u32;
+// The light being drawn, and the start of its block in `bins`. Set by both entry points.
+var<private> light: PointLight;
 var<private> bin_block: u32;
 
 @group(1) @binding(2)
@@ -61,7 +60,8 @@ const PIDIV2: f32 = 1.57079632679489661923132169163975144;
 struct VertexOutput {
     @builtin(position) position: vec4f,
     @location(0) @interpolate(flat) slot: u32,
-    @location(1) @interpolate(flat) color: vec4f,
+    @location(1) @interpolate(flat) light_index: u32,
+    @location(2) @interpolate(flat) color: vec4f,
 }
 
 // Draws a quad over the light's bounds, so pixels the light can't reach are never shaded.
@@ -70,8 +70,9 @@ fn vertex(
     @builtin(vertex_index) vertex_index: u32,
     @builtin(instance_index) slot: u32,
 ) -> VertexOutput {
-    set_light(slot);
-    let light = lights[light_index];
+    bin_block = slot * BIN_BLOCK_SIZE;
+    let light_index = bins[bin_block];
+    light = lights[light_index];
 
     // Map the corners of the light's world bounds to lightmap pixels,
     // inverting the mapping `fragment` uses.
@@ -88,27 +89,22 @@ fn vertex(
     lo = max(floor(lo) - 1.0, vec2f(-1.0));
     hi = min(ceil(hi) + 1.0, config.lightmap_size + 1.0);
 
-    // Two triangles: (0, 1, 2) and (2, 1, 3) in corner order.
-    var quad = array(0u, 1u, 2u, 2u, 1u, 3u);
-    let corner = quad[vertex_index];
+    // Two triangles over corners (0, 1, 2) and (2, 1, 3), one corner per hex digit.
+    let corner = (0x312210u >> (4u * vertex_index)) & 3u;
     let pixel = select(lo, hi, vec2(corner & 1u, corner >> 1u) == vec2(1u));
     // Tonemapping the light's color once here saves a LUT sample per pixel.
     var color = light.color;
 @if(TONEMAP_IN_SHADER)
     color = tonemapping::tone_mapping(color, view.color_grading);
 
-    return VertexOutput(vec4f(uv_to_ndc(pixel / config.lightmap_size), 0.0, 1.0), slot, color);
-}
-
-fn set_light(slot: u32) {
-    bin_block = slot * BIN_BLOCK_SIZE;
-    light_index = bins[bin_block];
+    let position = vec4f(uv_to_ndc(pixel / config.lightmap_size), 0.0, 1.0);
+    return VertexOutput(position, slot, light_index, color);
 }
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4f {
-    set_light(in.slot);
-    let light = lights[light_index];
+    bin_block = in.slot * BIN_BLOCK_SIZE;
+    light = lights[in.light_index];
     let position = in.position;
 
     let pos = ndc_to_world(frag_coord_to_ndc(position.xy * config.texture_scale));
@@ -122,9 +118,16 @@ fn fragment(in: VertexOutput) -> @location(0) vec4f {
         return vec4f(0);
     }
 
+    // Zeros where a read isn't needed behave the same as the real values.
     let uv = position.xy / config.lightmap_size;
-    let normal = textureLoad(normal_map, vec2<i32>(uv * vec2<f32>(textureDimensions(normal_map))), 0);
-    let stencil = textureSampleLevel(sprite_stencil, texture_sampler, uv, 0.0);
+    var normal = vec4f(0);
+    if config.normal_mode != 0 {
+        normal = textureLoad(normal_map, vec2<i32>(uv * vec2<f32>(textureDimensions(normal_map))), 0);
+    }
+    var stencil = vec4f(0);
+    if config.normal_mode != 0 || config.z_sorting == 1 {
+        stencil = textureSampleLevel(sprite_stencil, texture_sampler, uv, 0.0);
+    }
 
     let light_color = in.color;
 
@@ -267,7 +270,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4f {
 }
 
 fn poly_check(pos: vec2f, index: u32, term: u32, rev: u32, min_v: u32, split: u32, length: u32) -> f32 {
-    let light = lights[light_index];
     let occluder = poly_occluders[index];
 
     let angle = atan2(pos.y - light.pos.y, pos.x - light.pos.x);
@@ -399,7 +401,6 @@ fn get_softness_multi(light_range: f32, light_pos: vec2<f32>, pos: vec2<f32>, ex
 }
 
 fn angle_term(p: vec2f, i: u32, length: u32, term: u32) -> f32 {
-    let light = lights[light_index];
     var angle = atan2(p.y - light.pos.y, p.x - light.pos.x);
     
     if i == length - 1 && term == 1 {
@@ -427,7 +428,6 @@ fn vertex_reverse(start: u32, index: i32, start_vertex: u32, n_vertices: u32) ->
 } 
 
 fn bs_vertex_forward(angle: f32, start: u32, length: u32, term: u32, start_vertex: u32, n_vertices: u32) -> i32 {
-    let light = lights[light_index];
 
     var ans = -1;
     
@@ -459,7 +459,6 @@ fn bs_vertex_forward(angle: f32, start: u32, length: u32, term: u32, start_verte
 }
 
 fn bs_vertex_reverse(angle: f32, start: u32, length: u32, term: u32, start_vertex: u32, n_vertices: u32) -> i32 {
-    let light = lights[light_index];
 
     var ans = -1;
     
@@ -492,7 +491,6 @@ fn bs_vertex_reverse(angle: f32, start: u32, length: u32, term: u32, start_verte
 
 // checks if pixel is blocked by round occluder
 fn round_check(pos: vec2f, occluder: u32) -> f32 {
-    let light = lights[light_index];
 
     let occ = round_occluders[occluder];
     let half_w = occ.half_width;
