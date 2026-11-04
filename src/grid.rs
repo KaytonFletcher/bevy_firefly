@@ -14,9 +14,19 @@ pub(crate) struct OccluderGrid {
 impl OccluderGrid {
     /// Builds a grid over `aabbs`. Queries return indices into this slice.
     pub fn new(aabbs: &[Aabb2d]) -> Self {
-        // Cells about twice the average occluder size keep most occluders in one to four cells.
-        let total: f32 = aabbs.iter().map(|a| (a.max - a.min).max_element()).sum();
-        let cell_size = (2.0 * total / aabbs.len().max(1) as f32).max(1e-3);
+        // Cells twice the median occluder size keep most occluders in one to four cells.
+        // The median, unlike the mean, isn't skewed by a few huge occluders.
+        let mut sizes: Vec<f32> = aabbs
+            .iter()
+            .map(|a| (a.max - a.min).max_element())
+            .collect();
+        let median = if sizes.is_empty() {
+            0.0
+        } else {
+            let mid = sizes.len() / 2;
+            *sizes.select_nth_unstable_by(mid, f32::total_cmp).1
+        };
+        let cell_size = (2.0 * median).max(1e-3);
 
         let mut grid = Self {
             cell_size,
@@ -25,7 +35,9 @@ impl OccluderGrid {
         };
         for (i, aabb) in aabbs.iter().enumerate() {
             let (min, max) = grid.cell_range(aabb);
-            if cell_count(min, max) > MAX_CELLS_PER_OCCLUDER {
+            // Inverted or NaN bounds land in no cell, so keep them in `large` too.
+            let n_cells = cell_count(min, max);
+            if n_cells > MAX_CELLS_PER_OCCLUDER || n_cells <= 0 {
                 grid.large.push(i as u32);
                 continue;
             }
@@ -45,8 +57,8 @@ impl OccluderGrid {
         )
     }
 
-    /// Writes to `out`, in ascending order, every occluder that shares a cell with `aabb`.
-    /// This includes every occluder whose bounds intersect `aabb`.
+    /// Writes to `out`, in ascending order, every large occluder and every occluder sharing a
+    /// cell with `aabb`. This includes every occluder whose bounds intersect `aabb`.
     pub fn query(&self, aabb: &Aabb2d, out: &mut Vec<u32>) {
         out.clear();
         out.extend_from_slice(&self.large);

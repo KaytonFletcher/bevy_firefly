@@ -532,6 +532,9 @@ struct OccluderSnapshot {
     layers: RenderLayers,
     indices: [Option<(usize, u32)>; 3],
     frame: u32,
+    /// Position in the occluder list. The order sets the order of equally distant occluders
+    /// in a bin.
+    rank: usize,
 }
 
 fn buffer_index(index: Option<BufferIndex>) -> Option<(usize, u32)> {
@@ -552,13 +555,18 @@ impl OccluderHistory {
         frame: u32,
     ) -> OccluderChanges {
         let mut changed = vec![];
-        for (entity, occluder, round_index, poly_index) in occluders {
+        let mut reordered = false;
+        let mut last_rank = None;
+        for (rank, (entity, occluder, round_index, poly_index)) in occluders.iter().enumerate() {
             let indices = [
                 buffer_index(round_index.0),
                 buffer_index(poly_index.occluder),
                 buffer_index(poly_index.vertices),
             ];
             if let Some(old) = self.0.get_mut(entity) {
+                reordered |= last_rank.is_some_and(|last| old.rank < last);
+                last_rank = Some(old.rank);
+                old.rank = rank;
                 if old.pos == occluder.pos
                     && old.rot == occluder.rot
                     && old.aabb == occluder.aabb
@@ -582,6 +590,7 @@ impl OccluderHistory {
                     layers: occluder.render_layers.clone(),
                     indices,
                     frame,
+                    rank,
                 },
             );
         }
@@ -591,24 +600,29 @@ impl OccluderHistory {
             }
             old.frame == frame
         });
-        OccluderChanges::new(changed)
+        OccluderChanges {
+            // Occluders change order when their entities change archetype. That can change
+            // the order of tied occluders in any bin, so rebuild them all.
+            everywhere: reordered,
+            grid: OccluderGrid::new(&changed),
+            aabbs: changed,
+        }
     }
 }
 
 /// The bounds of occluders that changed this frame.
 struct OccluderChanges {
+    everywhere: bool,
     aabbs: Vec<Aabb2d>,
     grid: OccluderGrid,
 }
 
 impl OccluderChanges {
-    fn new(aabbs: Vec<Aabb2d>) -> Self {
-        let grid = OccluderGrid::new(&aabbs);
-        Self { aabbs, grid }
-    }
-
     /// Whether any change touches `aabb`. `scratch` is reused to avoid allocations.
     fn intersects(&self, aabb: &Aabb2d, scratch: &mut Vec<u32>) -> bool {
+        if self.everywhere {
+            return true;
+        }
         if self.aabbs.is_empty() {
             return false;
         }
