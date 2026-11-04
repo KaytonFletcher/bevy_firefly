@@ -14,7 +14,7 @@ use crate::{
         ExtractedWorldData, LightmapSize, NormalMode,
     },
     grid::OccluderGrid,
-    lights::{LightBatch, LightBatches, LightBindGroups, LightIndex, LightLut},
+    lights::{LightIndex, LightLut, PointLight2d},
     occluders::{PolyOccluderIndex, RoundOccluderIndex, point_inside_poly, translate_vertices},
     phases::SpritePhase,
     pipelines::{
@@ -44,7 +44,9 @@ use bevy::{
         },
         renderer::{RenderDevice, RenderQueue},
         texture::{FallbackImage, GpuImage, TextureCache},
-        view::{ExtractedView, RetainedViewEntity, ViewTarget, ViewUniforms},
+        view::{
+            ExtractedView, RenderVisibleEntities, RetainedViewEntity, ViewTarget, ViewUniforms,
+        },
     },
     shape::{Aabb2d, BoundingVolume, IntersectsVolume},
     tasks::{ComputeTaskPool, ParallelSliceMut},
@@ -163,6 +165,7 @@ fn prepare_config(
         Option<&ExtractedCombinedLightmaps>,
         Option<&ExtractedCombineLightmapTo>,
     )>,
+    mut buffers: Query<&mut BufferedFireflyConfig>,
     mut commands: Commands,
 ) {
     for (entity, config, view_target, combined_lightmap, combine_to) in &configs {
@@ -226,11 +229,17 @@ fn prepare_config(
             texture_scale: scale,
             lightmap_size: vec2(target_size.width as f32, target_size.height as f32),
         };
-        let mut buffer = UniformBuffer::<UniformFireflyConfig>::from(uniform);
-        buffer.write_buffer(&render_device, &render_queue);
-        commands
-            .entity(entity)
-            .insert(BufferedFireflyConfig(buffer));
+        // Reuse last frame's buffer, so it isn't reallocated every frame.
+        if let Ok(mut buffer) = buffers.get_mut(entity) {
+            buffer.0.set(uniform);
+            buffer.0.write_buffer(&render_device, &render_queue);
+        } else {
+            let mut buffer = UniformBuffer::<UniformFireflyConfig>::from(uniform);
+            buffer.write_buffer(&render_device, &render_queue);
+            commands
+                .entity(entity)
+                .insert(BufferedFireflyConfig(buffer));
+        }
     }
 }
 
@@ -334,7 +343,7 @@ fn prepare_lightmap(
 pub(crate) fn prepare_data(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
-    mut lights: Query<(Entity, &ExtractedPointLight, &LightIndex, &mut BinBuffers)>,
+    mut light_query: Query<(Entity, &ExtractedPointLight, &LightIndex, &mut BinBuffers)>,
     occluders: Query<(
         Entity,
         &ExtractedOccluder,
@@ -350,11 +359,10 @@ pub(crate) fn prepare_data(
         &NormalMapTexture,
         &BufferedFireflyConfig,
         &FireflyConfig,
+        &RenderVisibleEntities,
     )>,
     lightmap_pipeline: Res<LightmapCreationPipeline>,
-    mut light_bind_groups: ResMut<LightBindGroups>,
     mut view_bins: ResMut<ViewBins>,
-    mut batches: ResMut<LightBatches>,
     round_occluders: Res<BufferManager<UniformRoundOccluder>>,
     poly_occluders: Res<BufferManager<UniformOccluder>>,
     light_buffer: Res<BufferManager<UniformPointLight>>,
@@ -363,11 +371,10 @@ pub(crate) fn prepare_data(
     mut history: ResMut<OccluderHistory>,
     mut frame: Local<u32>,
 ) {
-    batches.clear();
     *frame = frame.wrapping_add(1);
     let frame = *frame;
 
-    let mut lights: Vec<_> = lights.iter_mut().collect();
+    let mut lights: Vec<_> = light_query.iter_mut().collect();
 
     let occluders: Vec<_> = occluders.iter().collect();
     let aabbs: Vec<_> = occluders.iter().map(|(_, o, ..)| o.aabb).collect();
@@ -464,35 +471,37 @@ pub(crate) fn prepare_data(
         }
     });
 
-    // Concatenate every light's bins into one buffer per view, so each view needs a single
-    // bind group. A light's slot in its view's buffer is the instance index it's drawn with.
-    for bins in view_bins.values_mut() {
-        bins.clear();
-    }
-    for (entity, _, light_index, bins) in &mut lights {
-        let Some(light_index) = light_index.0 else {
-            continue;
-        };
-        for (view, bin) in bins.views.iter().filter(|(_, bin)| bin.visible) {
-            let slot = view_bins
-                .entry(*view)
-                .or_default()
-                .push(light_index.index as u32, bin);
-            batches.insert((*view, *entity), LightBatch { slot });
-        }
-    }
+    drop(lights);
 
-    view_bins.retain(|_, bins| bins.n_lights() > 0);
-    light_bind_groups.values.clear();
-
+    // Concatenate the bins of each view's visible lights into one buffer per view, so a view
+    // needs one bind group and one draw. A light's slot is the instance index it's drawn with.
+    view_bins.retain(|view, _| cameras.iter().any(|c| c.0.retained_view_entity == *view));
     for camera in &cameras {
-        let view = camera.0.retained_view_entity;
-        let Some(bins) = view_bins.get_mut(&view) else {
+        let bins = view_bins.entry(camera.0.retained_view_entity).or_default();
+        bins.clear();
+        let Some(visible) = camera.8.get::<PointLight2d>() else {
             continue;
         };
+        for (entity, _) in visible.iter_visible() {
+            let Ok((_, _, light_index, light_bins)) = light_query.get(*entity) else {
+                continue;
+            };
+            let (Some(light_index), Some(bin)) = (
+                light_index.0,
+                light_bins.views.get(&camera.0.retained_view_entity),
+            ) else {
+                continue;
+            };
+            if bin.visible {
+                bins.push(light_index.index as u32, bin);
+            }
+        }
+        if bins.n_lights() == 0 {
+            continue;
+        }
         bins.write(&render_device, &render_queue);
 
-        let bind_group = render_device.create_bind_group(
+        bins.bind_group = Some(render_device.create_bind_group(
             "light bind group",
             &pipeline_cache.get_bind_group_layout(&lightmap_pipeline.layout),
             &BindGroupEntries::sequential((
@@ -507,8 +516,7 @@ pub(crate) fn prepare_data(
                 &camera.5.0.default_view,
                 camera.6.0.binding().unwrap(),
             )),
-        );
-        light_bind_groups.values.insert(view, bind_group);
+        ));
     }
 }
 
