@@ -20,7 +20,8 @@ use bevy::{
     render::{
         Render, RenderApp, RenderStartup, RenderSystems,
         render_resource::{
-            BindingResource, BufferUsages, RawBufferVec, ShaderType, encase::private::WriteInto,
+            BindGroup, BindingResource, BufferUsages, RawBufferVec, ShaderType,
+            encase::private::WriteInto,
         },
         renderer::{RenderDevice, RenderQueue},
         view::RetainedViewEntity,
@@ -590,6 +591,8 @@ pub struct ViewBinBuffers {
     occluders: RawBufferVec<OccluderPointer>,
     /// One block of [`BIN_BLOCK_SIZE`] per light. See [`BIN_BLOCK_SIZE`].
     bins: RawBufferVec<u32>,
+    /// The light pass's bind group for this view. `None` when the view has no lights.
+    pub bind_group: Option<BindGroup>,
 }
 
 impl Default for ViewBinBuffers {
@@ -597,6 +600,7 @@ impl Default for ViewBinBuffers {
         let mut res = Self {
             occluders: RawBufferVec::new(BufferUsages::STORAGE),
             bins: RawBufferVec::new(BufferUsages::STORAGE),
+            bind_group: None,
         };
         res.occluders.set_label("view occluder bins".into());
         res.bins.set_label("view bin indices".into());
@@ -607,6 +611,7 @@ impl Default for ViewBinBuffers {
 
 impl ViewBinBuffers {
     pub fn clear(&mut self) {
+        self.bind_group = None;
         self.occluders.clear();
         self.occluders.push(OccluderPointer::default());
         self.bins.clear();

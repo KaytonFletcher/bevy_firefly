@@ -13,7 +13,6 @@ use bevy::{
             lifetimeless::{Read, SRes},
         },
     },
-    platform::collections::HashMap,
     prelude::*,
     render::{
         Render, RenderApp, RenderSystems,
@@ -26,17 +25,14 @@ use bevy::{
         },
         render_resource::{BindGroup, PipelineCache, ShaderType, SpecializedRenderPipelines},
         sync_world::SyncToRenderWorld,
-        view::{
-            ExtractedView, RenderVisibleEntities, ResolvedCompositingSpace, RetainedViewEntity,
-            ViewUniformOffset,
-        },
+        view::{ExtractedView, RenderVisibleEntities, ResolvedCompositingSpace, ViewUniformOffset},
     },
 };
 use bytemuck::NoUninit;
 
 use crate::{
     LightBatchSetKey,
-    buffers::{BinBuffers, BufferIndex},
+    buffers::{BinBuffers, BufferIndex, ViewBins},
     change::Changes,
     data::ExtractedCombineLightmapTo,
     phases::LightmapPhase,
@@ -321,7 +317,6 @@ pub struct LightPlugin;
 impl Plugin for LightPlugin {
     fn build(&self, app: &mut App) {
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-            render_app.init_resource::<LightBindGroups>();
             render_app.init_resource::<DrawFunctions<LightmapPhase>>();
             render_app.init_resource::<ViewBinnedRenderPhases<LightmapPhase>>();
 
@@ -335,27 +330,6 @@ impl Plugin for LightPlugin {
             render_app.add_systems(Render, queue_lights.in_set(RenderSystems::Queue));
         }
     }
-
-    fn finish(&self, app: &mut App) {
-        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-            render_app.init_resource::<LightBatches>();
-        }
-    }
-}
-
-#[derive(Resource, Deref, DerefMut, Default)]
-pub(crate) struct LightBatches(pub HashMap<(RetainedViewEntity, Entity), LightBatch>);
-
-#[derive(PartialEq, Eq, Clone, Debug)]
-pub(crate) struct LightBatch {
-    /// The light's slot in its view's bins, and the instance index it's drawn with.
-    pub slot: u32,
-}
-
-/// The bind group of each view, shared by all its lights.
-#[derive(Resource, Default)]
-pub(crate) struct LightBindGroups {
-    pub values: HashMap<RetainedViewEntity, BindGroup>,
 }
 
 #[derive(Component)]
@@ -441,47 +415,45 @@ fn queue_lights(
 
         let pipeline = pipelines.specialize(&pipeline_cache, &pipeline, view_key);
 
-        if let Some(visible_entities) = visible_entities.get::<PointLight2d>() {
-            for (render_entity, visible_entity) in visible_entities.iter_visible() {
-                let batch_set_key = LightBatchSetKey {
+        // All of a view's lights are drawn in one instanced draw, so queue a single item,
+        // represented by any visible light.
+        if let Some((entity, main_entity)) = visible_entities
+            .get::<PointLight2d>()
+            .and_then(|lights| lights.iter_visible().next())
+        {
+            lightmap_phase.add(
+                LightBatchSetKey {
                     pipeline,
                     draw_function: draw_lightmap_function,
-                };
-
-                lightmap_phase.add(
-                    batch_set_key,
-                    (),
-                    (*render_entity, *visible_entity),
-                    InputUniformIndex::default(),
-                    BinnedRenderPhaseType::NonMesh,
-                );
-            }
+                },
+                (),
+                (*entity, *main_entity),
+                InputUniformIndex::default(),
+                BinnedRenderPhaseType::NonMesh,
+            );
         }
     }
 }
 
-pub(crate) type DrawLightmap = (SetItemPipeline, SetLightTextureBindGroup, DrawLightBatch);
+pub(crate) type DrawLightmap = (SetItemPipeline, SetLightBindGroups, DrawLights);
 
-pub(crate) struct SetLightTextureBindGroup;
-impl<P: PhaseItem> RenderCommand<P> for SetLightTextureBindGroup {
-    type Param = (SRes<LightBindGroups>, SRes<LightBatches>);
+pub(crate) struct SetLightBindGroups;
+impl<P: PhaseItem> RenderCommand<P> for SetLightBindGroups {
+    type Param = SRes<ViewBins>;
     type ViewQuery = (Read<ExtractedView>, Read<ViewUniformOffset>, Read<LightLut>);
     type ItemQuery = ();
 
     fn render<'w>(
-        item: &P,
+        _: &P,
         (view, view_uniform_offset, lut): ROQueryItem<'w, '_, Self::ViewQuery>,
         _entity: Option<()>,
-        (bind_groups, batches): SystemParamItem<'w, '_, Self::Param>,
+        view_bins: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
-        if !batches.contains_key(&(view.retained_view_entity, item.entity())) {
-            return RenderCommandResult::Skip;
-        }
-        let Some(bind_group) = bind_groups
+        let Some(bind_group) = view_bins
             .into_inner()
-            .values
             .get(&view.retained_view_entity)
+            .and_then(|bins| bins.bind_group.as_ref())
         else {
             return RenderCommandResult::Skip;
         };
@@ -493,27 +465,25 @@ impl<P: PhaseItem> RenderCommand<P> for SetLightTextureBindGroup {
     }
 }
 
-/// Draws the light's quad, with its slot in the view's bins as the instance index.
-pub(crate) struct DrawLightBatch;
-impl<P: PhaseItem> RenderCommand<P> for DrawLightBatch {
-    type Param = SRes<LightBatches>;
+/// Draws a quad for every light in the view. The instance index is the light's slot in the
+/// view's bins.
+pub(crate) struct DrawLights;
+impl<P: PhaseItem> RenderCommand<P> for DrawLights {
+    type Param = SRes<ViewBins>;
     type ViewQuery = Read<ExtractedView>;
     type ItemQuery = ();
 
     fn render<'w>(
-        item: &P,
+        _: &P,
         view: ROQueryItem<'w, '_, Self::ViewQuery>,
         _entity: Option<()>,
-        batches: SystemParamItem<'w, '_, Self::Param>,
+        view_bins: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
-        let Some(batch) = batches
-            .into_inner()
-            .get(&(view.retained_view_entity, item.entity()))
-        else {
+        let Some(bins) = view_bins.into_inner().get(&view.retained_view_entity) else {
             return RenderCommandResult::Skip;
         };
-        pass.draw(0..6, batch.slot..batch.slot + 1);
+        pass.draw(0..6, 0..bins.n_lights() as u32);
         RenderCommandResult::Success
     }
 }
