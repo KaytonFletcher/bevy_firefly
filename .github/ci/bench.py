@@ -1,17 +1,31 @@
-"""Benchmarks every commit of a pull request and checks that none changes the rendered output.
+"""Benchmarks a series of commits and checks that none changes the rendered output.
 
-Usage: bench.py BASE_SHA OUT_DIR
+Runs natively on Windows, macOS and Linux, on whatever GPU the machine has. CI passes `--xvfb`
+to render on a virtual display with Mesa's software Vulkan driver instead.
 
-For each commit after BASE_SHA, starting at the one that adds this script, this builds that commit's `src` with this checkout's examples,
-then renders the screenshot-only bench scenes and the examples in REGRESSION_EXAMPLES.
-After every commit is built, it runs the timed bench scenes for all commits in BENCH_ROUNDS
-interleaved rounds, so runner drift hits every commit alike, and reports the median and range.
+    pip install numpy pillow
+    python .github/ci/bench.py main                      # main, then each commit up to HEAD
+    python .github/ci/bench.py --commits main HEAD       # just these two
+    python .github/ci/bench.py main --scenes lights --rounds 3 --skip-images --out results
 
-The first commit is the reference: every later commit's images must match it exactly.
-An image that differs is rendered twice more, to tell a flaky example from a real change.
-Results go to OUT_DIR/<short sha>/ and a markdown summary to OUT_DIR/summary.md.
+The first commit is the reference. With BASE, that's BASE itself if it has this script, or
+else the commit that adds it, since earlier commits lack the timing spans the bench reads.
+
+Each commit's `src` and `Cargo.toml` are built with HEAD's examples, in a temporary git
+worktree, so uncommitted changes are left alone and aren't benchmarked. The build shares this
+checkout's `target` directory.
+
+For each commit this renders the screenshot-only bench scenes and REGRESSION_EXAMPLES. Then it
+times the timed scenes for all commits in `--rounds` interleaved rounds, so drift (other apps,
+thermal throttling) hits every commit alike, and reports the median and range.
+
+Every later commit's images must match the reference exactly. An image that differs is rendered
+twice more, to tell a flaky example from a real change. Results go to OUT/<short sha>/ and a
+markdown summary to OUT/summary.md. Keep the windows visible while it runs: some platforms
+throttle hidden windows.
 """
 
+import argparse
 import json
 import os
 import re
@@ -19,6 +33,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -28,38 +43,54 @@ TIMED_SCENES = ["lights", "tiles", "moving"]
 CHECK_SCENES = ["lights_scaled", "lights_fixed", "moving_rotated", "sprites", "sprites_scaled"]
 REGRESSION_EXAMPLES = ["simple", "shapes", "crates", "flashlight", "blending", "fov", "render_layers", "test"]
 FEATURES = "bevy/bevy_ci_testing,bevy/trace_chrome"
-TARGET = Path("target/release/examples")
-SCREENSHOT_CONFIG = Path(".github/ci/screenshot.ron").resolve()
-ROUNDS = int(os.environ.get("BENCH_ROUNDS", "5"))
+SCREENSHOT_CONFIG = Path(__file__).resolve().parent / "screenshot.ron"
+EXE = ".exe" if os.name == "nt" else ""
 RETRIES = 2
+TIMEOUT_S = 900
+
+
+class Bench:
+    """Settings shared by every run: where the binaries are and how to launch them."""
+
+    def __init__(self, args, worktree, target):
+        self.args, self.worktree, self.target = args, worktree, target / "release" / "examples"
+
+    def binary(self, name):
+        return self.target / f"{name}{EXE}"
+
+    def launch(self, cmd, env, log, cwd=None):
+        """Runs `cmd` with its output in `log`. Returns the exit status and the logged errors."""
+        if self.args.xvfb:
+            cmd = ["xvfb-run", "-a", "-s", "-screen 0 1280x720x24", *cmd]
+        with open(log, "w", encoding="utf-8") as f:
+            try:
+                status = subprocess.run(
+                    list(map(str, cmd)),
+                    env={**os.environ, "BEVY_ASSET_ROOT": str(self.worktree), **env},
+                    cwd=cwd,
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                    timeout=TIMEOUT_S,
+                ).returncode
+            except subprocess.TimeoutExpired:
+                status = "timeout"
+        text = Path(log).read_text(encoding="utf-8", errors="replace")
+        errors = [line for line in text.splitlines() if " ERROR " in line or "panicked" in line]
+        return status, errors
 
 
 def run(cmd, **kwargs):
     print("+", " ".join(map(str, cmd)), flush=True)
-    return subprocess.run(cmd, check=True, **kwargs)
+    return subprocess.run(list(map(str, cmd)), check=True, **kwargs)
 
 
-def git(*args):
-    return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout.strip()
-
-
-def xvfb(cmd, env, log, cwd=None):
-    with open(log, "w") as f:
-        status = subprocess.run(
-            ["timeout", "900", "xvfb-run", "-a", "-s", "-screen 0 1280x720x24", *cmd],
-            env={**os.environ, "BEVY_ASSET_ROOT": str(Path.cwd()), **env},
-            cwd=cwd,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-        ).returncode
-    text = Path(log).read_text(errors="replace")
-    errors = [line for line in text.splitlines() if " ERROR " in line or "panicked" in line]
-    return status, errors
+def git(*args, cwd=None):
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
 
 
 def system_times(trace_path):
     """Median duration in ms of each bevy_firefly system, from a chrome trace."""
-    events = json.loads(Path(trace_path).read_text())
+    events = json.loads(Path(trace_path).read_text(encoding="utf-8"))
     if isinstance(events, dict):
         events = events.get("traceEvents", [])
     open_spans, durations = {}, {}
@@ -89,11 +120,11 @@ def compare(a, b):
     return int((delta > 0).sum()), int(delta.max())
 
 
-def render_example(example, out):
+def render_example(bench, example, out):
     work = out / f"run-{example}"
     work.mkdir(exist_ok=True)
-    status, errors = xvfb(
-        [(TARGET / example).resolve()],
+    status, errors = bench.launch(
+        [bench.binary(example)],
         {"CI_TESTING_CONFIG": str(SCREENSHOT_CONFIG), "TRACE_CHROME": str(work / "trace.json")},
         out / f"{example}.log",
         cwd=work,
@@ -102,25 +133,33 @@ def render_example(example, out):
     if status != 0:
         errors.append(f"{example} exited with {status}")
     for shot in work.glob("screenshot-*.png"):
-        shot.rename(out / f"{example}.png")
+        shot.replace(out / f"{example}.png")
     shutil.rmtree(work)
     return errors
 
 
-def bench_commit(sha, out, ref):
+def bench_commit(bench, sha, out, ref):
     """Builds `sha` and renders its check images. `ref` is the reference commit's dir, if any."""
     out.mkdir(parents=True, exist_ok=True)
-    run(["git", "checkout", "-q", sha, "--", "src", "Cargo.toml"])
+    wt = bench.worktree
+    # Remove `src` first, so files that `sha` doesn't have aren't left over from another commit.
+    shutil.rmtree(wt / "src")
+    run(["git", "checkout", "-q", sha, "--", "src", "Cargo.toml"], cwd=wt)
     result = {"sha": sha, "subject": git("log", "-1", "--format=%s", sha), "scenes": {}, "errors": [], "flaky": {}}
 
-    examples = sorted(set(["bench", *REGRESSION_EXAMPLES]))
-    args = [a for e in examples for a in ("--example", e)]
+    examples = ["bench"] if bench.args.skip_images else sorted({"bench", *REGRESSION_EXAMPLES})
     try:
-        run(["cargo", "build", "--release", "--features", FEATURES, *args])
+        run(
+            ["cargo", "build", "--release", "--features", FEATURES, *[a for e in examples for a in ("--example", e)]],
+            cwd=wt,
+            env={**os.environ, "CARGO_TARGET_DIR": str(bench.target.parent.parent)},
+        )
     except subprocess.CalledProcessError:
         result["errors"].append("build failed")
         return result
-    shutil.copy(TARGET / "bench", out / "bench-bin")
+    shutil.copy(bench.binary("bench"), out / f"bench-bin{EXE}")
+    if bench.args.skip_images:
+        return result
 
     for scene in CHECK_SCENES:
         env = {
@@ -130,22 +169,22 @@ def bench_commit(sha, out, ref):
             "FIREFLY_BENCH_WARMUP": "3",
             "FIREFLY_BENCH_FRAMES": "3",
         }
-        status, errors = xvfb([out / "bench-bin"], env, out / f"bench-{scene}.log")
+        status, errors = bench.launch([out / f"bench-bin{EXE}"], env, out / f"bench-{scene}.log")
         result["errors"] += [f"bench {scene}: {e}" for e in errors[:5]]
         if status != 0:
             result["errors"].append(f"bench {scene} exited with {status}")
 
     for example in REGRESSION_EXAMPLES:
-        result["errors"] += render_example(example, out)
+        result["errors"] += render_example(bench, example, out)
         image, ref_image = out / f"{example}.png", ref and ref / f"{example}.png"
         if not (ref_image and ref_image.exists() and image.exists()) or compare(ref_image, image) == (0, 0):
             continue
         # Render again: if a retry matches, the example is nondeterministic, not changed.
         first = image.with_suffix(".first.png")
-        image.rename(first)
+        image.replace(first)
         diffs = []
         for _ in range(RETRIES):
-            render_example(example, out)
+            render_example(bench, example, out)
             diffs.append(image.exists() and compare(ref_image, image) != (0, 0))
         if not all(diffs):
             result["flaky"][example] = f"{sum(diffs) + 1}/{RETRIES + 1} renders differ"
@@ -156,41 +195,43 @@ def bench_commit(sha, out, ref):
     return result
 
 
-def time_commits(results, out):
-    """Runs every timed scene for every built commit, ROUNDS times, alternating commits."""
+def time_commits(bench, results, out):
+    """Runs every timed scene for every built commit, `--rounds` times, alternating commits."""
     rounds = {}
-    for r in range(ROUNDS):
+    for r in range(bench.args.rounds):
         for res in results:
             dir = out / res["sha"][:8]
-            if not (dir / "bench-bin").exists():
+            binary = dir / f"bench-bin{EXE}"
+            if not binary.exists():
                 continue
-            for scene in TIMED_SCENES:
+            for scene in bench.args.scenes:
+                print(f"round {r + 1}/{bench.args.rounds}: {res['sha'][:8]} {scene}", flush=True)
                 env = {
                     "FIREFLY_BENCH_SCENE": scene,
                     "FIREFLY_BENCH_OUT": str(dir / f"{scene}.json"),
                     "FIREFLY_BENCH_SCREENSHOT": str(dir / (f"bench-{scene}.png" if r == 0 else "discard.png")),
                     "TRACE_CHROME": str(dir / f"trace-{scene}.json"),
                 }
-                status, errors = xvfb([dir / "bench-bin"], env, dir / f"bench-{scene}.log")
+                status, errors = bench.launch([binary], env, dir / f"bench-{scene}.log")
                 if r == 0:
                     res["errors"] += [f"bench {scene}: {e}" for e in errors[:5]]
                 if status != 0:
                     res["errors"].append(f"bench {scene} round {r} exited with {status}")
                     continue
-                data = json.loads((dir / f"{scene}.json").read_text())
+                data = json.loads((dir / f"{scene}.json").read_text(encoding="utf-8"))
                 diag = data.get("diagnostics_median", {})
                 systems = system_times(dir / f"trace-{scene}.json")
                 (dir / f"trace-{scene}.json").unlink(missing_ok=True)
                 for key, value in metrics(data["frame_ms_median"], diag, systems).items():
                     rounds.setdefault((res["sha"], scene, key), []).append(value)
     for res in results:
-        for name in ("discard.png", "bench-bin"):
+        for name in ("discard.png", f"bench-bin{EXE}"):
             (out / res["sha"][:8] / name).unlink(missing_ok=True)
-        for scene in TIMED_SCENES:
+        for scene in bench.args.scenes:
             values = {k: rounds.get((res["sha"], scene, k)) for k in METRICS}
             if values["frame"]:
                 res["scenes"][scene] = values
-        (out / res["sha"][:8] / "result.json").write_text(json.dumps(res, indent=2))
+        (out / res["sha"][:8] / "result.json").write_text(json.dumps(res, indent=2), encoding="utf-8")
 
 
 METRICS = ["frame", "gpu", "invocations", "prepare_data", "systems"]
@@ -223,17 +264,17 @@ def cell(values, prev):
     return text
 
 
-def summary(results, out):
+def summary(bench, results, out):
     ref, lines = results[0], ["# Firefly benchmark", ""]
     lines.append(f"Reference commit: `{ref['sha'][:8]}` {ref['subject']}")
     lines.append("")
     lines.append(
-        f"Medians in ms over {ROUNDS} rounds. Percentages compare each commit with the one before it; "
+        f"Medians in ms over {bench.args.rounds} rounds. Percentages compare each commit with the one before it; "
         "`~` means the two commits' ranges overlap, so the change is within noise. "
         "Frame range is min–max across rounds."
     )
 
-    for scene in TIMED_SCENES:
+    for scene in bench.args.scenes:
         lines += ["", f"## {scene}", ""]
         lines.append(
             "| Commit | Frame | Frame range | Lightmap GPU | Lightmap fragment invocations (M) "
@@ -291,23 +332,66 @@ def summary(results, out):
         lines += ["", "## Errors", ""] + [f"- `{e[:300]}`" for e in errors]
 
     text = "\n".join(lines) + "\n"
-    (out / "summary.md").write_text(text)
+    (out / "summary.md").write_text(text, encoding="utf-8")
     print(text)
     return failed
 
 
-def main():
-    base, out = sys.argv[1], Path(sys.argv[2]).resolve()
+def resolve(ref):
+    sha = subprocess.run(["git", "rev-parse", "--verify", "-q", f"{ref}^{{commit}}"], capture_output=True, text=True)
+    if sha.returncode != 0:
+        sys.exit(f"{ref!r} isn't a commit here. Fetch it, or use origin/{ref}.")
+    return sha.stdout.strip()
+
+
+def commits_to_bench(args):
+    if args.commits:
+        return [resolve(c) for c in args.commits]
+    if not args.base:
+        sys.exit("give BASE or --commits")
+    base = resolve(args.base)
     commits = git("rev-list", "--reverse", "--first-parent", "--no-merges", f"{base}..HEAD").split()
-    # Earlier commits lack the timing spans the bench reads.
+    has_script = subprocess.run(["git", "cat-file", "-e", f"{base}:.github/ci/bench.py"], capture_output=True)
+    if has_script.returncode == 0:
+        return [base, *commits]
     first = git("rev-list", "--reverse", f"{base}..HEAD", "--", ".github/ci/bench.py").split()[0]
-    commits = commits[commits.index(first) :]
-    results = []
-    for sha in commits:
-        results.append(bench_commit(sha, out / sha[:8], results and out / results[0]["sha"][:8]))
-    run(["git", "checkout", "-q", "HEAD", "--", "src", "Cargo.toml"])
-    time_commits(results, out)
-    return 1 if summary(results, out) else 0
+    return commits[commits.index(first) :]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("base", nargs="?", help="benchmark the commits after this one, up to HEAD")
+    parser.add_argument("out_dir", nargs="?", metavar="OUT", help="results directory, same as --out")
+    parser.add_argument("--out", help="results directory (default bench-results)")
+    parser.add_argument("--commits", nargs="+", metavar="REF", help="benchmark these commits instead of BASE..HEAD")
+    parser.add_argument("--rounds", type=int, default=5, help="timing rounds per commit (default 5)")
+    parser.add_argument("--scenes", nargs="+", default=TIMED_SCENES, choices=TIMED_SCENES, help="timed scenes")
+    parser.add_argument("--skip-images", action="store_true", help="only time; skip the image checks")
+    parser.add_argument("--xvfb", action="store_true", help="run on a virtual X display (Linux CI)")
+    args = parser.parse_args()
+    if args.commits and args.base:
+        parser.error("give either BASE or --commits, not both")
+    if args.xvfb and not shutil.which("xvfb-run"):
+        parser.error("--xvfb needs xvfb-run (apt install xvfb)")
+    sys.stdout.reconfigure(encoding="utf-8")
+
+    commits = commits_to_bench(args)
+    root = Path(git("rev-parse", "--show-toplevel"))
+    out = Path(args.out or args.out_dir or "bench-results").resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    target = Path(os.environ.get("CARGO_TARGET_DIR", root / "target")).resolve()
+    worktree = Path(tempfile.mkdtemp(prefix="firefly-bench-")) / "repo"
+    run(["git", "worktree", "add", "-q", "--detach", worktree, "HEAD"])
+    try:
+        bench = Bench(args, worktree, target)
+        results = []
+        for sha in commits:
+            results.append(bench_commit(bench, sha, out / sha[:8], results and out / results[0]["sha"][:8]))
+        time_commits(bench, results, out)
+    finally:
+        run(["git", "worktree", "remove", "--force", worktree])
+        shutil.rmtree(worktree.parent, ignore_errors=True)
+    return 1 if summary(bench, results, out) else 0
 
 
 if __name__ == "__main__":

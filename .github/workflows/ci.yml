@@ -183,7 +183,7 @@ jobs:
       - name: Benchmark
         run: |
           set +e
-          python3 .github/ci/bench.py ${{ github.event.pull_request.base.sha }} bench-results
+          python3 .github/ci/bench.py --xvfb ${{ github.event.pull_request.base.sha }} bench-results
           status=$?
           cat bench-results/summary.md >> "$GITHUB_STEP_SUMMARY"
           exit $status

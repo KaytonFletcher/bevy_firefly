@@ -138,6 +138,19 @@ Some notable limitations that Firefly currently has:
 
 These aren't hard limitations though, and can be overcome with some effort. I just didn't have the time yet. If you want me to prioritize fixing any of them, feel free to open an issue. 
 
+## Benchmarking
+
+`.github/ci/bench.py` builds a series of commits, times the bench scenes on your GPU, and checks that no commit changes what the examples render. It runs on Windows, macOS and Linux, needs Python 3.9+, and leaves your working copy alone.
+
+```sh
+pip install numpy pillow
+python .github/ci/bench.py main                  # main, then each commit up to HEAD
+python .github/ci/bench.py --commits main HEAD   # just these two
+python .github/ci/bench.py main --scenes lights --rounds 3 --skip-images
+```
+
+Results go to `bench-results/summary.md`. Commit your changes first, since only commits are benchmarked. Keep the windows visible while it runs, as some platforms throttle hidden windows. To time a single scene, run `cargo run --release --example bench`. The settings are listed at the top of `examples/bench.rs`.
+
 ## Alternatives
 
 There are a few other 2d lighting solutions for Bevy that I'm aware of: 
