@@ -23,40 +23,49 @@ var texture_sampler: sampler;
 @group(1) @binding(1)
 var<storage> lights: array<PointLight>;
 
-@group(1) @binding(2)
-var<storage> light_index: u32; 
+// The light being drawn. Set at the start of both entry points from the instance index.
+var<private> light_index: u32;
 
-@group(1) @binding(3)
+@group(1) @binding(2)
 var<storage> round_occluders: array<RoundOccluder>;
 
-@group(1) @binding(4)
+@group(1) @binding(3)
 var<storage> poly_occluders: array<PolyOccluder>;
 
-@group(1) @binding(5)
+@group(1) @binding(4)
 var<storage> vertices: array<vec2f>;
 
-@group(1) @binding(6)
+@group(1) @binding(5)
 var<storage> occluders: array<OccluderPointer>;
 
-@group(1) @binding(7)
+@group(1) @binding(6)
 var<storage> bin_indices: BinIndices;
 
-@group(1) @binding(8)
+@group(1) @binding(7)
 var sprite_stencil: texture_2d<f32>;
 
-@group(1) @binding(9)
+@group(1) @binding(8)
 var normal_map: texture_2d<f32>;
 
-@group(1) @binding(10)
+@group(1) @binding(9)
 var<uniform> config: FireflyConfig;
 
 const PI2: f32 = 6.28318530717958647692528676655900577;
 const PI: f32 = 3.14159265358979323846264338327950288;
 const PIDIV2: f32 = 1.57079632679489661923132169163975144; 
 
+struct VertexOutput {
+    @builtin(position) position: vec4f,
+    @location(0) @interpolate(flat) light_index: u32,
+}
+
 // Draws a quad over the light's bounds, so pixels the light can't reach are never shaded.
 @vertex
-fn vertex(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4f {
+fn vertex(
+    @builtin(vertex_index) vertex_index: u32,
+    @builtin(instance_index) instance_index: u32,
+) -> VertexOutput {
+    light_index = instance_index;
     let light = lights[light_index];
 
     // Map the corners of the light's world bounds to lightmap pixels,
@@ -78,12 +87,14 @@ fn vertex(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4f 
     var quad = array(0u, 1u, 2u, 2u, 1u, 3u);
     let corner = quad[vertex_index];
     let pixel = select(lo, hi, vec2(corner & 1u, corner >> 1u) == vec2(1u));
-    return vec4f(uv_to_ndc(pixel / config.lightmap_size), 0.0, 1.0);
+    return VertexOutput(vec4f(uv_to_ndc(pixel / config.lightmap_size), 0.0, 1.0), light_index);
 }
 
 @fragment
-fn fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
+fn fragment(in: VertexOutput) -> @location(0) vec4f {
+    light_index = in.light_index;
     let light = lights[light_index];
+    let position = in.position;
 
     let pos = ndc_to_world(frag_coord_to_ndc(position.xy * config.texture_scale));
     let dist = distance(pos, light.pos);

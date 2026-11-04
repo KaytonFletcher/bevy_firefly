@@ -98,28 +98,23 @@ fn init_lightmap_creation_pipeline(
                     storage_buffer_read_only::<UniformPointLight>(false)
                         .visibility(ShaderStages::VERTEX_FRAGMENT),
                 ),
-                (
-                    2,
-                    storage_buffer_read_only::<u32>(false)
-                        .visibility(ShaderStages::VERTEX_FRAGMENT),
-                ),
                 // round occluders
-                (3, storage_buffer_read_only::<UniformRoundOccluder>(false)),
+                (2, storage_buffer_read_only::<UniformRoundOccluder>(false)),
                 // poly occluders
-                (4, storage_buffer_read_only::<UniformOccluder>(false)),
+                (3, storage_buffer_read_only::<UniformOccluder>(false)),
                 // vertices
-                (5, storage_buffer_read_only::<Vec2>(false)),
+                (4, storage_buffer_read_only::<Vec2>(false)),
                 // occluders
-                (6, storage_buffer_read_only::<OccluderPointer>(false)),
+                (5, storage_buffer_read_only::<OccluderPointer>(false)),
                 // bins
-                (7, storage_buffer_read_only::<BinIndices>(false)),
+                (6, storage_buffer_read_only::<BinIndices>(false)),
                 // sprite stencil
-                (8, texture_2d(TextureSampleType::Float { filterable: true })),
+                (7, texture_2d(TextureSampleType::Float { filterable: true })),
                 // sprite normal map
-                (9, texture_2d(TextureSampleType::Float { filterable: true })),
+                (8, texture_2d(TextureSampleType::Float { filterable: true })),
                 // config,
                 (
-                    10,
+                    9,
                     uniform_buffer::<UniformFireflyConfig>(false)
                         .visibility(ShaderStages::VERTEX_FRAGMENT),
                 ),
