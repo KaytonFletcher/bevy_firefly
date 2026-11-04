@@ -77,12 +77,11 @@ struct FireflyConfig {
     // 0 - multiply, 1 - add, 2 - max, 3 - min, 4 - none
     combination_mode: u32,
 
-    texture_scale: vec2<f32>
+    texture_scale: vec2<f32>,
+    // Size in pixels of the texture the lightmap is rendered to.
+    lightmap_size: vec2<f32>,
 }
 
-// Should correspond to the value in buffers.rs!
+// Should correspond to the values in buffers.rs!
 const N_BINS: u32 = 256;
-
-struct BinIndices {
-    indices: array<u32, N_BINS + 1>,
-}
+const BIN_BLOCK_SIZE: u32 = N_BINS + 2;

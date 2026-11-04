@@ -13,7 +13,6 @@ use bevy::{
             lifetimeless::{Read, SRes},
         },
     },
-    platform::collections::HashMap,
     prelude::*,
     render::{
         Render, RenderApp, RenderSystems,
@@ -24,21 +23,16 @@ use bevy::{
             RenderCommand, RenderCommandResult, SetItemPipeline, TrackedRenderPass,
             ViewBinnedRenderPhases,
         },
-        render_resource::{
-            BindGroup, PipelineCache, ShaderType, SpecializedRenderPipelines, StorageBuffer,
-        },
-        sync_world::SyncToRenderWorld,
-        view::{
-            ExtractedView, RenderVisibleEntities, ResolvedCompositingSpace, RetainedViewEntity,
-            ViewUniformOffset,
-        },
+        render_resource::{BindGroup, PipelineCache, ShaderType, SpecializedRenderPipelines},
+        sync_world::{MainEntity, SyncToRenderWorld},
+        view::{ExtractedView, RenderVisibleEntities, ResolvedCompositingSpace, ViewUniformOffset},
     },
 };
 use bytemuck::NoUninit;
 
 use crate::{
     LightBatchSetKey,
-    buffers::{BinBuffers, BufferIndex},
+    buffers::{BinBuffers, BufferIndex, ViewBins},
     change::Changes,
     data::ExtractedCombineLightmapTo,
     phases::LightmapPhase,
@@ -267,7 +261,7 @@ impl LightCore {
 
 /// The data that is extracted to the render world from a [`PointLight2d`].
 #[derive(Component, Clone)]
-#[require(BinBuffers, LightIndex, LightPointer)]
+#[require(BinBuffers, LightIndex)]
 pub struct ExtractedPointLight {
     pub pos: Vec2,
     pub color: Color,
@@ -317,17 +311,12 @@ pub struct UniformPointLight {
     pub height: f32,
 }
 
-/// Render World component that contains the buffer a [`PointLight2d`] writes to each frame.   
-#[derive(Component, Default)]
-pub struct LightPointer(pub StorageBuffer<u32>);
-
 /// Plugin responsible for functionality related to lights. Added automatically
 /// by [`FireflyPlugin`](crate::prelude::FireflyPlugin).
 pub struct LightPlugin;
 impl Plugin for LightPlugin {
     fn build(&self, app: &mut App) {
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-            render_app.init_resource::<LightBindGroups>();
             render_app.init_resource::<DrawFunctions<LightmapPhase>>();
             render_app.init_resource::<ViewBinnedRenderPhases<LightmapPhase>>();
 
@@ -341,25 +330,6 @@ impl Plugin for LightPlugin {
             render_app.add_systems(Render, queue_lights.in_set(RenderSystems::Queue));
         }
     }
-
-    fn finish(&self, app: &mut App) {
-        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-            render_app.init_resource::<LightBatches>();
-        }
-    }
-}
-
-#[derive(Resource, Deref, DerefMut, Default)]
-pub(crate) struct LightBatches(pub HashMap<(RetainedViewEntity, Entity), LightBatch>);
-
-#[derive(PartialEq, Eq, Clone, Debug)]
-pub(crate) struct LightBatch {
-    pub id: Entity,
-}
-
-#[derive(Resource, Default)]
-pub(crate) struct LightBindGroups {
-    pub values: HashMap<Entity, HashMap<RetainedViewEntity, BindGroup>>,
 }
 
 #[derive(Component)]
@@ -445,75 +415,77 @@ fn queue_lights(
 
         let pipeline = pipelines.specialize(&pipeline_cache, &pipeline, view_key);
 
-        if let Some(visible_entities) = visible_entities.get::<PointLight2d>() {
-            for (render_entity, visible_entity) in visible_entities.iter_visible() {
-                let batch_set_key = LightBatchSetKey {
+        // One item per view; `DrawLights` draws all its lights. Binned phases keep items
+        // between frames, so clear last frame's item first.
+        lightmap_phase.non_mesh_items.clear();
+        let any_lights = visible_entities
+            .get::<PointLight2d>()
+            .is_some_and(|lights| lights.iter_visible().next().is_some());
+        if any_lights {
+            let placeholder = (Entity::PLACEHOLDER, MainEntity::from(Entity::PLACEHOLDER));
+            lightmap_phase.add(
+                LightBatchSetKey {
                     pipeline,
                     draw_function: draw_lightmap_function,
-                };
-
-                lightmap_phase.add(
-                    batch_set_key,
-                    (),
-                    (*render_entity, *visible_entity),
-                    InputUniformIndex::default(),
-                    BinnedRenderPhaseType::NonMesh,
-                );
-            }
+                },
+                (),
+                placeholder,
+                InputUniformIndex::default(),
+                BinnedRenderPhaseType::NonMesh,
+            );
         }
     }
 }
 
-pub(crate) type DrawLightmap = (SetItemPipeline, SetLightTextureBindGroup, DrawLightBatch);
+pub(crate) type DrawLightmap = (SetItemPipeline, SetLightBindGroups, DrawLights);
 
-pub(crate) struct SetLightTextureBindGroup;
-impl<P: PhaseItem> RenderCommand<P> for SetLightTextureBindGroup {
-    type Param = (SRes<LightBindGroups>, SRes<LightBatches>);
+pub(crate) struct SetLightBindGroups;
+impl<P: PhaseItem> RenderCommand<P> for SetLightBindGroups {
+    type Param = SRes<ViewBins>;
     type ViewQuery = (Read<ExtractedView>, Read<ViewUniformOffset>, Read<LightLut>);
     type ItemQuery = ();
 
     fn render<'w>(
-        item: &P,
+        _: &P,
         (view, view_uniform_offset, lut): ROQueryItem<'w, '_, Self::ViewQuery>,
         _entity: Option<()>,
-        (image_bind_groups, batches): SystemParamItem<'w, '_, Self::Param>,
+        view_bins: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
-        let image_bind_groups = image_bind_groups.into_inner();
-        let Some(batch) = batches.get(&(view.retained_view_entity, item.entity())) else {
+        let Some(bind_group) = view_bins
+            .into_inner()
+            .get(&view.retained_view_entity)
+            .and_then(|bins| bins.bind_group.as_ref())
+        else {
             return RenderCommandResult::Skip;
         };
 
         pass.set_bind_group(0, &lut.0, &[view_uniform_offset.offset]);
-        pass.set_bind_group(
-            1,
-            image_bind_groups
-                .values
-                .get(&batch.id)
-                .unwrap()
-                .get(&view.retained_view_entity)
-                .unwrap(),
-            &[],
-        );
+        pass.set_bind_group(1, bind_group, &[]);
 
         RenderCommandResult::Success
     }
 }
 
-pub(crate) struct DrawLightBatch;
-impl<P: PhaseItem> RenderCommand<P> for DrawLightBatch {
-    type Param = ();
+/// Draws a quad for every light in the view. The instance index is the light's slot in the
+/// view's bins.
+pub(crate) struct DrawLights;
+impl<P: PhaseItem> RenderCommand<P> for DrawLights {
+    type Param = SRes<ViewBins>;
     type ViewQuery = Read<ExtractedView>;
     type ItemQuery = ();
 
     fn render<'w>(
         _: &P,
-        _: ROQueryItem<'w, '_, Self::ViewQuery>,
+        view: ROQueryItem<'w, '_, Self::ViewQuery>,
         _entity: Option<()>,
-        _: SystemParamItem<'w, '_, Self::Param>,
+        view_bins: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
-        pass.draw(0..3, 0..1);
+        let Some(bins) = view_bins.into_inner().get(&view.retained_view_entity) else {
+            return RenderCommandResult::Skip;
+        };
+        pass.draw(0..6, 0..bins.n_lights() as u32);
         RenderCommandResult::Success
     }
 }

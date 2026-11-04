@@ -199,6 +199,7 @@ pub struct UniformFireflyConfig {
     pub n_combined_lightmaps: u32,
     pub combination_mode: u32,
     pub texture_scale: Vec2,
+    pub lightmap_size: Vec2,
 }
 
 /// Add this **relationship** component to a camera in order to combine it's lightmap into the result of another lightmap.

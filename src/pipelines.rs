@@ -30,7 +30,7 @@ use bevy::{
 };
 
 use crate::{
-    buffers::{BinIndices, OccluderPointer},
+    buffers::OccluderPointer,
     data::UniformFireflyConfig,
     lights::UniformPointLight,
     occluders::{UniformOccluder, UniformRoundOccluder},
@@ -77,14 +77,12 @@ pub struct LightmapCreationPipeline {
     pub layout: BindGroupLayoutDescriptor,
     pub lut_layout: BindGroupLayoutDescriptor,
     pub sampler: Sampler,
-    pub vertex_state: VertexState,
     pub shader: Handle<Shader>,
 }
 
 fn init_lightmap_creation_pipeline(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
-    fullscreen_shader: Res<FullscreenShader>,
     asset_server: Res<AssetServer>,
 ) {
     let layout = BindGroupLayoutDescriptor::new(
@@ -95,55 +93,59 @@ fn init_lightmap_creation_pipeline(
                 // sampler
                 (0, sampler(SamplerBindingType::Filtering)),
                 // point lights
-                (1, storage_buffer_read_only::<UniformPointLight>(false)),
-                (2, storage_buffer_read_only::<u32>(false)),
+                (
+                    1,
+                    storage_buffer_read_only::<UniformPointLight>(false)
+                        .visibility(ShaderStages::VERTEX_FRAGMENT),
+                ),
                 // round occluders
-                (3, storage_buffer_read_only::<UniformRoundOccluder>(false)),
+                (2, storage_buffer_read_only::<UniformRoundOccluder>(false)),
                 // poly occluders
-                (4, storage_buffer_read_only::<UniformOccluder>(false)),
+                (3, storage_buffer_read_only::<UniformOccluder>(false)),
                 // vertices
-                (5, storage_buffer_read_only::<Vec2>(false)),
+                (4, storage_buffer_read_only::<Vec2>(false)),
                 // occluders
-                (6, storage_buffer_read_only::<OccluderPointer>(false)),
+                (5, storage_buffer_read_only::<OccluderPointer>(false)),
                 // bins
-                (7, storage_buffer_read_only::<BinIndices>(false)),
+                (
+                    6,
+                    storage_buffer_read_only::<u32>(false)
+                        .visibility(ShaderStages::VERTEX_FRAGMENT),
+                ),
                 // sprite stencil
-                (8, texture_2d(TextureSampleType::Float { filterable: true })),
+                (7, texture_2d(TextureSampleType::Float { filterable: true })),
                 // sprite normal map
-                (9, texture_2d(TextureSampleType::Float { filterable: true })),
+                (8, texture_2d(TextureSampleType::Float { filterable: true })),
                 // config,
-                (10, uniform_buffer::<UniformFireflyConfig>(false)),
+                (
+                    9,
+                    uniform_buffer::<UniformFireflyConfig>(false)
+                        .visibility(ShaderStages::VERTEX_FRAGMENT),
+                ),
             ),
         ),
     );
 
+    // The vertex shader tonemaps each light's color, so it needs the LUT too.
     let tonemapping_lut_entries = get_lut_bind_group_layout_entries();
     let lut_layout = BindGroupLayoutDescriptor::new(
-        "sprite_view_layout",
+        "light_view_layout",
         &BindGroupLayoutEntries::with_indices(
             ShaderStages::VERTEX_FRAGMENT,
             (
                 (0, uniform_buffer::<ViewUniform>(true)),
-                (
-                    1,
-                    tonemapping_lut_entries[0].visibility(ShaderStages::FRAGMENT),
-                ),
-                (
-                    2,
-                    tonemapping_lut_entries[1].visibility(ShaderStages::FRAGMENT),
-                ),
+                (1, tonemapping_lut_entries[0]),
+                (2, tonemapping_lut_entries[1]),
             ),
         ),
     );
 
     let sampler = render_device.create_sampler(&SamplerDescriptor::default());
-    let vertex_state = fullscreen_shader.to_vertex_state();
 
     commands.insert_resource(LightmapCreationPipeline {
         layout,
         lut_layout,
         sampler,
-        vertex_state,
         shader: load_embedded_asset!(asset_server.as_ref(), "shaders/create_lightmap.wesl"),
     });
 }
@@ -263,7 +265,12 @@ impl SpecializedRenderPipeline for LightmapCreationPipeline {
         RenderPipelineDescriptor {
             label: Some(Cow::Borrowed("lightmap creation pipeline")),
             layout: vec![self.lut_layout.clone(), self.layout.clone()],
-            vertex: self.vertex_state.clone(),
+            vertex: VertexState {
+                shader: self.shader.clone(),
+                shader_defs: shader_defs.clone(),
+                entry_point: Some(Cow::Borrowed("vertex")),
+                ..default()
+            },
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
                 targets: vec![Some(ColorTargetState {

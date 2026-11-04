@@ -4,12 +4,17 @@ use core::f32;
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use crate::{
-    CombinedLightMapTextures, LightmapPhase, NormalMapTexture, SpriteStencilTexture,
-    buffers::{BinBuffer, BinBuffers, BufferManager, OccluderData, OccluderPointer, VertexBuffer},
-    data::{
-        CombinationMode, ExtractedCombinedLightmaps, ExtractedWorldData, LightmapSize, NormalMode,
+    CombinedLightMapTextures, NormalMapTexture, SpriteStencilTexture,
+    buffers::{
+        BinBuffers, BinKey, BufferIndex, BufferManager, OccluderData, OccluderPointer,
+        VertexBuffer, ViewBins,
     },
-    lights::{LightBatch, LightBatches, LightBindGroups, LightIndex, LightLut, LightPointer},
+    data::{
+        CombinationMode, ExtractedCombineLightmapTo, ExtractedCombinedLightmaps,
+        ExtractedWorldData, LightmapSize, NormalMode,
+    },
+    grid::OccluderGrid,
+    lights::{LightIndex, LightLut, PointLight2d},
     occluders::{PolyOccluderIndex, RoundOccluderIndex, point_inside_poly, translate_vertices},
     phases::SpritePhase,
     pipelines::{
@@ -27,24 +32,23 @@ use bevy::{
     camera::visibility::RenderLayers,
     core_pipeline::tonemapping::{Tonemapping, TonemappingLuts, get_lut_bindings},
     math::Affine3A,
-    platform::{
-        collections::{HashMap, HashSet},
-        hash::FixedHasher,
-    },
+    platform::collections::HashMap,
     prelude::*,
     render::{
         Render, RenderApp, RenderSystems,
         render_asset::RenderAssets,
-        render_phase::{PhaseItem, ViewBinnedRenderPhases, ViewSortedRenderPhases},
+        render_phase::{PhaseItem, ViewSortedRenderPhases},
         render_resource::{
-            BindGroup, BindGroupEntries, Extent3d, PipelineCache, SpecializedRenderPipelines,
+            BindGroupEntries, Extent3d, PipelineCache, SpecializedRenderPipelines,
             TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, UniformBuffer,
         },
         renderer::{RenderDevice, RenderQueue},
         texture::{FallbackImage, GpuImage, TextureCache},
-        view::{ExtractedView, RetainedViewEntity, ViewTarget, ViewUniforms},
+        view::{
+            ExtractedView, RenderVisibleEntities, RetainedViewEntity, ViewTarget, ViewUniforms,
+        },
     },
-    shape::{Aabb2d, IntersectsVolume},
+    shape::{Aabb2d, BoundingVolume, IntersectsVolume},
     tasks::{ComputeTaskPool, ParallelSliceMut},
 };
 
@@ -77,9 +81,15 @@ impl Plugin for PreparePlugin {
             specialize_light_application_pipeline.in_set(RenderSystems::Prepare),
         );
 
+        render_app.init_resource::<OccluderHistory>();
         render_app.add_systems(Render, prepare_data.in_set(RenderSystems::Prepare));
-        render_app.add_systems(Render, prepare_config.in_set(RenderSystems::Prepare));
-        render_app.add_systems(Render, prepare_lightmap.in_set(RenderSystems::Prepare));
+        // `prepare_data` reads the config and textures these insert, for the same frame.
+        render_app.add_systems(
+            Render,
+            (prepare_config, prepare_lightmap)
+                .before(prepare_data)
+                .in_set(RenderSystems::Prepare),
+        );
 
         render_app.add_systems(
             Render,
@@ -127,6 +137,24 @@ fn specialize_light_application_pipeline(
     }
 }
 
+/// Size of the lightmap texture of a camera with this config.
+fn lightmap_extent(config: &FireflyConfig, view_target: &ViewTarget) -> Extent3d {
+    let window_size = view_target.main_texture().size();
+    match config.lightmap_size {
+        LightmapSize::Window => window_size,
+        LightmapSize::Fixed(size) => Extent3d {
+            width: size.x,
+            height: size.y,
+            depth_or_array_layers: 1,
+        },
+        LightmapSize::Scaled(scale) => Extent3d {
+            width: (window_size.width as f32 * scale) as u32,
+            height: (window_size.height as f32 * scale) as u32,
+            depth_or_array_layers: 1,
+        },
+    }
+}
+
 fn prepare_config(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
@@ -135,11 +163,20 @@ fn prepare_config(
         &FireflyConfig,
         &ViewTarget,
         Option<&ExtractedCombinedLightmaps>,
+        Option<&ExtractedCombineLightmapTo>,
     )>,
+    mut buffers: Query<&mut BufferedFireflyConfig>,
     mut commands: Commands,
 ) {
-    for (entity, config, view_target, combined_lightmap) in &configs {
+    for (entity, config, view_target, combined_lightmap, combine_to) in &configs {
         let window_size = view_target.main_texture().size();
+
+        // A lightmap combined into another camera's is drawn into that camera's texture array.
+        let target_size = match combine_to.and_then(|to| configs.get(to.0).ok()) {
+            Some((_, config, view_target, ..)) => lightmap_extent(config, view_target),
+            None => lightmap_extent(config, view_target),
+        };
+
         let scale = match config.lightmap_size {
             LightmapSize::Window => vec2(1.0, 1.0),
             LightmapSize::Fixed(size) => vec2(
@@ -155,15 +192,9 @@ fn prepare_config(
 
             light_bands: config.light_bands.unwrap_or(0.0),
 
-            soft_shadows: match config.soft_shadows {
-                true => 1,
-                false => 0,
-            },
+            soft_shadows: config.soft_shadows as u32,
 
-            z_sorting: match config.z_sorting {
-                false => 0,
-                true => 1,
-            },
+            z_sorting: config.z_sorting as u32,
 
             z_sorting_error_margin: config.z_sorting_error_margin,
 
@@ -190,12 +221,19 @@ fn prepare_config(
             },
 
             texture_scale: scale,
+            lightmap_size: vec2(target_size.width as f32, target_size.height as f32),
         };
-        let mut buffer = UniformBuffer::<UniformFireflyConfig>::from(uniform);
-        buffer.write_buffer(&render_device, &render_queue);
-        commands
-            .entity(entity)
-            .insert(BufferedFireflyConfig(buffer));
+        // Reuse last frame's buffer, so it isn't reallocated every frame.
+        if let Ok(mut buffer) = buffers.get_mut(entity) {
+            buffer.0.set(uniform);
+            buffer.0.write_buffer(&render_device, &render_queue);
+        } else {
+            let mut buffer = UniformBuffer::<UniformFireflyConfig>::from(uniform);
+            buffer.write_buffer(&render_device, &render_queue);
+            commands
+                .entity(entity)
+                .insert(BufferedFireflyConfig(buffer));
+        }
     }
 }
 
@@ -214,21 +252,7 @@ fn prepare_lightmap(
 ) {
     for (entity, view_target, view, combined_lightmaps, config, _msaa) in &view_targets {
         let format = view.target_format;
-        let window_size = view_target.main_texture().size();
-
-        let size = match config.lightmap_size {
-            LightmapSize::Window => window_size,
-            LightmapSize::Fixed(size) => Extent3d {
-                width: size.x,
-                height: size.y,
-                depth_or_array_layers: 1,
-            },
-            LightmapSize::Scaled(scale) => Extent3d {
-                width: (window_size.width as f32 * scale) as u32,
-                height: (window_size.height as f32 * scale) as u32,
-                depth_or_array_layers: 1,
-            },
-        };
+        let size = lightmap_extent(config, view_target);
 
         let light_map_texture = texture_cache.get(
             &render_device,
@@ -313,14 +337,13 @@ fn prepare_lightmap(
 pub(crate) fn prepare_data(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
-    mut lights: Query<(
+    mut light_query: Query<(&ExtractedPointLight, &LightIndex, &mut BinBuffers)>,
+    occluders: Query<(
         Entity,
-        &ExtractedPointLight,
-        &mut LightPointer,
-        &LightIndex,
-        &mut BinBuffers,
+        &ExtractedOccluder,
+        &RoundOccluderIndex,
+        &PolyOccluderIndex,
     )>,
-    occluders: Query<(&ExtractedOccluder, &RoundOccluderIndex, &PolyOccluderIndex)>,
     cameras: Query<(
         &ExtractedView,
         &RenderLayers,
@@ -330,242 +353,414 @@ pub(crate) fn prepare_data(
         &NormalMapTexture,
         &BufferedFireflyConfig,
         &FireflyConfig,
+        &RenderVisibleEntities,
     )>,
-    _phases: Res<ViewBinnedRenderPhases<LightmapPhase>>,
     lightmap_pipeline: Res<LightmapCreationPipeline>,
-    mut light_bind_groups: ResMut<LightBindGroups>,
-    mut batches: ResMut<LightBatches>,
+    mut view_bins: ResMut<ViewBins>,
     round_occluders: Res<BufferManager<UniformRoundOccluder>>,
     poly_occluders: Res<BufferManager<UniformOccluder>>,
     light_buffer: Res<BufferManager<UniformPointLight>>,
     vertices: Res<VertexBuffer>,
     pipeline_cache: Res<PipelineCache>,
+    mut history: ResMut<OccluderHistory>,
+    mut frame: Local<u32>,
 ) {
-    batches.clear();
+    *frame = frame.wrapping_add(1);
+    let frame = *frame;
 
-    let light_bind_groups = &mut *light_bind_groups;
+    let mut lights: Vec<_> = light_query.iter_mut().collect();
 
-    let mut lights: Vec<_> = lights.iter_mut().collect();
+    let occluders: Vec<_> = occluders.iter().collect();
+    let aabbs: Vec<_> = occluders.iter().map(|(_, o, ..)| o.aabb).collect();
+    let occluder_grid = OccluderGrid::new(&aabbs);
+    let changes = history.update(&occluders, frame);
 
-    lights
-        .par_splat_map_mut(ComputeTaskPool::get(), None, |_, lights| {
-            let mut bind_groups: Vec<(Entity, HashMap<RetainedViewEntity, BindGroup>)> = vec![];
+    lights.par_splat_map_mut(ComputeTaskPool::get(), None, |_, lights| {
+        let mut nearby = vec![];
+        for (light, light_index, bins) in lights {
+            for bin in bins.views.values_mut() {
+                bin.visible = false;
+            }
+            if light_index.0.is_none() {
+                bins.key = None;
+                continue;
+            }
 
-            for (entity, light, light_pointer, light_index, bins) in lights {
-                let Some(index) = light_index.0 else {
-                    continue;
-                };
-
-                light_pointer.0.set(index.index as u32);
-                light_pointer.0.write_buffer(&render_device, &render_queue);
-
-                let Some(light_pointer_binding) = light_pointer.0.binding() else {
-                    continue;
-                };
-
-                let cameras = cameras
-                    .iter()
-                    .filter_map(|camera| {
-                        if !camera.1.intersects(&light.render_layers) {
-                            return None;
-                        }
-
-                        let Projection::Orthographic(projection) = camera.3 else {
-                            return None;
-                        };
-
-                        let camera_rect = Rect {
-                            min: projection.area.min + camera.2.camera_pos,
-                            max: projection.area.max + camera.2.camera_pos,
-                        };
-
-                        let light_rect = camera_rect.union_point(light.pos).intersect(Rect {
-                            min: light.pos - light.radius,
-                            max: light.pos + light.radius,
-                        });
-
-                        if light_rect.is_empty() {
-                            return None;
-                        }
-
-                        let light_aabb = Aabb2d {
-                            min: light_rect.min,
-                            max: light_rect.max,
-                        };
-
-                        let bins = bins
-                            .0
-                            .entry(camera.0.retained_view_entity)
-                            .or_insert(default());
-                        bins.reset();
-
-                        Some((camera, light_aabb))
-                    })
-                    .collect::<Vec<_>>();
-
-                for (occluder, round_index, poly_index) in &occluders {
-                    if !light.cast_shadows
-                        || !light.render_layers.intersects(&occluder.render_layers)
-                    {
-                        continue;
+            // The views this light is visible in, and its bounds in each.
+            let views = cameras
+                .iter()
+                .filter_map(|camera| {
+                    if !camera.1.intersects(&light.render_layers) {
+                        return None;
                     }
 
-                    let mut any_soft_shadows = false;
+                    let Projection::Orthographic(projection) = camera.3 else {
+                        return None;
+                    };
 
-                    let mut retained_views: HashSet<_, FixedHasher> = HashSet::default();
+                    let camera_rect = Rect {
+                        min: projection.area.min + camera.2.camera_pos,
+                        max: projection.area.max + camera.2.camera_pos,
+                    };
 
-                    cameras.iter().for_each(|(camera, light_aabb)| {
-                        if !occluder.aabb.intersects(light_aabb)
-                            || !camera.1.intersects(&occluder.render_layers)
-                        {
-                            return;
-                        }
-
-                        any_soft_shadows |= camera.7.soft_shadows;
-
-                        retained_views.insert(camera.0.retained_view_entity);
+                    let light_rect = camera_rect.union_point(light.pos).intersect(Rect {
+                        min: light.pos - light.radius,
+                        max: light.pos + light.radius,
                     });
 
-                    let bins = bins
-                        .0
-                        .iter_mut()
-                        .filter(|(retained_view, _bin)| retained_views.contains(*retained_view))
-                        .map(|(_, x)| x)
-                        .collect::<Vec<_>>();
-
-                    if let Occluder2dShape::RoundRectangle {
-                        half_width,
-                        half_height,
-                        radius,
-                    } = occluder.shape
-                    {
-                        let Some(occluder_index) = round_index.0 else {
-                            continue;
-                        };
-
-                        let vertices = vec![
-                            vec2(-half_width - radius, -half_height - radius),
-                            vec2(-half_width - radius, half_height + radius),
-                            vec2(half_width + radius, half_height + radius),
-                            vec2(half_width + radius, -half_height - radius),
-                        ];
-
-                        let light_pos =
-                            Vec2::from_angle(-occluder.rot).rotate(light.pos - occluder.pos);
-
-                        let aabb = Aabb2d {
-                            min: vec2(-half_width - radius, -half_height - radius),
-                            max: vec2(half_width + radius, half_height + radius),
-                        };
-
-                        let isometry = Isometry2d {
-                            translation: occluder.pos,
-                            rotation: Rot2::radians(occluder.rot),
-                        };
-
-                        let vertices =
-                            translate_vertices(vertices, isometry.translation, isometry.rotation);
-
-                        let closest = aabb.closest_point(light_pos);
-                        let light_inside_occluder = closest == light_pos;
-
-                        push_vertices(
-                            bins,
-                            &vertices,
-                            light.pos,
-                            light.core.radius,
-                            0,
-                            occluder_index.index as u32,
-                            closest.distance(light_pos),
-                            // 0.0,
-                            light_inside_occluder,
-                            false,
-                            any_soft_shadows,
-                            true,
-                        );
-                    } else {
-                        let Some(occluder_index) = poly_index.occluder else {
-                            continue;
-                        };
-
-                        let Some(vertex_index) = poly_index.vertices else {
-                            continue;
-                        };
-
-                        let vertices = occluder.vertices();
-
-                        let light_inside_occluder =
-                            matches!(occluder.shape, Occluder2dShape::Polygon { .. })
-                                && point_inside_poly(
-                                    light.pos,
-                                    &vertices,
-                                    occluder.aabb,
-                                    occluder.shape.is_concave(),
-                                );
-
-                        let closest = occluder.aabb.closest_point(light.pos);
-
-                        push_vertices(
-                            bins,
-                            &vertices,
-                            light.pos,
-                            light.core.radius,
-                            vertex_index.index as u32,
-                            occluder_index.index as u32,
-                            closest.distance(light.pos),
-                            light_inside_occluder,
-                            true,
-                            any_soft_shadows,
-                            occluder.shape.is_concave(),
-                        );
+                    if light_rect.is_empty() {
+                        return None;
                     }
-                }
 
-                let mut bind_group = HashMap::default();
-                for (camera, _) in cameras {
-                    let bins = bins.0.get_mut(&camera.0.retained_view_entity).unwrap();
-                    bins.write(&render_device, &render_queue);
-                    bind_group.insert(
+                    let aabb = Aabb2d {
+                        min: light_rect.min,
+                        max: light_rect.max,
+                    };
+                    Some((
                         camera.0.retained_view_entity,
-                        render_device.create_bind_group(
-                            "light bind group",
-                            &pipeline_cache.get_bind_group_layout(&lightmap_pipeline.layout),
-                            &BindGroupEntries::sequential((
-                                &lightmap_pipeline.sampler,
-                                light_buffer.binding(),
-                                light_pointer_binding.clone(),
-                                round_occluders.binding(),
-                                poly_occluders.binding(),
-                                vertices.binding(),
-                                bins.bin_binding(),
-                                bins.bin_indices_binding(),
-                                &camera.4.0.default_view,
-                                &camera.5.0.default_view,
-                                camera.6.0.binding().unwrap(),
-                            )),
-                        ),
-                    );
-                }
+                        camera.1,
+                        camera.7.soft_shadows,
+                        aabb,
+                    ))
+                })
+                .collect::<Vec<_>>();
 
-                bind_groups.push((*entity, bind_group));
+            for (view, ..) in &views {
+                bins.views.entry(*view).or_default().visible = true;
             }
-            bind_groups
-        })
-        .iter()
-        .for_each(|bind_groups| {
-            for (entity, bind_group) in bind_groups {
-                light_bind_groups
-                    .values
-                    .entry(*entity)
-                    .insert(bind_group.clone());
 
-                for retained_view in bind_group.keys() {
-                    batches
-                        .entry((*retained_view, *entity))
-                        .insert(LightBatch { id: *entity });
-                }
+            // Reuse last frame's bins if neither the light, its views,
+            // nor any occluder near it changed since.
+            let key = BinKey {
+                pos: light.pos,
+                core_radius: light.core.radius,
+                cast_shadows: light.cast_shadows,
+                layers: light.render_layers.clone(),
+                views: views
+                    .iter()
+                    .map(|(view, layers, soft, aabb)| (*view, *aabb, (*layers).clone(), *soft))
+                    .collect(),
+            };
+            let reuse = bins.frame == frame.wrapping_sub(1)
+                && bins.key.as_ref() == Some(&key)
+                && !views
+                    .iter()
+                    .any(|view| changes.intersects(&view.3, &mut nearby));
+            bins.frame = frame;
+            if reuse {
+                continue;
             }
+            bins.key = Some(key);
+
+            if light.cast_shadows && !views.is_empty() {
+                fill_bins(light, &views, bins, &occluders, &occluder_grid, &mut nearby);
+            }
+            for (view, ..) in &views {
+                bins.views.get_mut(view).unwrap().finish();
+            }
+        }
+    });
+
+    drop(lights);
+
+    // Concatenate each view's visible lights' bins, so a view needs one bind group and one
+    // draw. A light's slot is its instance index.
+    view_bins.retain(|view, _| cameras.iter().any(|c| c.0.retained_view_entity == *view));
+    for camera in &cameras {
+        let bins = view_bins.entry(camera.0.retained_view_entity).or_default();
+        bins.clear();
+        let Some(visible) = camera.8.get::<PointLight2d>() else {
+            continue;
+        };
+        for (entity, _) in visible.iter_visible() {
+            let Ok((_, light_index, light_bins)) = light_query.get(*entity) else {
+                continue;
+            };
+            let (Some(light_index), Some(bin)) = (
+                light_index.0,
+                light_bins.views.get(&camera.0.retained_view_entity),
+            ) else {
+                continue;
+            };
+            if bin.visible {
+                bins.push(light_index.index as u32, bin);
+            }
+        }
+        if bins.n_lights() == 0 {
+            continue;
+        }
+        bins.write(&render_device, &render_queue);
+
+        bins.bind_group = Some(render_device.create_bind_group(
+            "light bind group",
+            &pipeline_cache.get_bind_group_layout(&lightmap_pipeline.layout),
+            &BindGroupEntries::sequential((
+                &lightmap_pipeline.sampler,
+                light_buffer.binding(),
+                round_occluders.binding(),
+                poly_occluders.binding(),
+                vertices.binding(),
+                bins.occluders_binding(),
+                bins.bins_binding(),
+                &camera.4.0.default_view,
+                &camera.5.0.default_view,
+                camera.6.0.binding().unwrap(),
+            )),
+        ));
+    }
+}
+
+/// What each occluder's part of the bins depended on last frame.
+#[derive(Resource, Default)]
+pub(crate) struct OccluderHistory(HashMap<Entity, OccluderSnapshot>);
+
+struct OccluderSnapshot {
+    pos: Vec2,
+    rot: f32,
+    aabb: Aabb2d,
+    shape: Occluder2dShape,
+    layers: RenderLayers,
+    indices: [Option<(usize, u32)>; 3],
+    frame: u32,
+    /// Position in the occluder list. The order sets the order of equally distant occluders
+    /// in a bin.
+    rank: usize,
+}
+
+fn buffer_index(index: Option<BufferIndex>) -> Option<(usize, u32)> {
+    index.map(|i| (i.index, i.generation))
+}
+
+impl OccluderHistory {
+    /// Records this frame's occluders and returns where they changed since last frame:
+    /// the old and new bounds of each occluder that moved or changed, was added or was removed.
+    fn update(
+        &mut self,
+        occluders: &[(
+            Entity,
+            &ExtractedOccluder,
+            &RoundOccluderIndex,
+            &PolyOccluderIndex,
+        )],
+        frame: u32,
+    ) -> OccluderChanges {
+        let mut changed = vec![];
+        let mut reordered = false;
+        let mut last_rank = None;
+        for (rank, (entity, occluder, round_index, poly_index)) in occluders.iter().enumerate() {
+            let indices = [
+                buffer_index(round_index.0),
+                buffer_index(poly_index.occluder),
+                buffer_index(poly_index.vertices),
+            ];
+            if let Some(old) = self.0.get_mut(entity) {
+                reordered |= last_rank.is_some_and(|last| old.rank < last);
+                last_rank = Some(old.rank);
+                old.rank = rank;
+                if old.pos == occluder.pos
+                    && old.rot == occluder.rot
+                    && old.aabb == occluder.aabb
+                    && old.indices == indices
+                    && old.layers == occluder.render_layers
+                    && old.shape == occluder.shape
+                {
+                    old.frame = frame;
+                    continue;
+                }
+                changed.push(old.aabb);
+            }
+            changed.push(occluder.aabb);
+            self.0.insert(
+                *entity,
+                OccluderSnapshot {
+                    pos: occluder.pos,
+                    rot: occluder.rot,
+                    aabb: occluder.aabb,
+                    shape: occluder.shape.clone(),
+                    layers: occluder.render_layers.clone(),
+                    indices,
+                    frame,
+                    rank,
+                },
+            );
+        }
+        self.0.retain(|_, old| {
+            if old.frame != frame {
+                changed.push(old.aabb);
+            }
+            old.frame == frame
         });
+        OccluderChanges {
+            // Occluders change order when their entities change archetype. That can change
+            // the order of tied occluders in any bin, so rebuild them all.
+            everywhere: reordered,
+            grid: OccluderGrid::new(&changed),
+            aabbs: changed,
+        }
+    }
+}
+
+/// The bounds of occluders that changed this frame.
+struct OccluderChanges {
+    everywhere: bool,
+    aabbs: Vec<Aabb2d>,
+    grid: OccluderGrid,
+}
+
+impl OccluderChanges {
+    /// Whether any change touches `aabb`. `scratch` is reused to avoid allocations.
+    fn intersects(&self, aabb: &Aabb2d, scratch: &mut Vec<u32>) -> bool {
+        if self.everywhere {
+            return true;
+        }
+        if self.aabbs.is_empty() {
+            return false;
+        }
+        self.grid.query(aabb, scratch);
+        scratch
+            .iter()
+            .any(|&i| self.aabbs[i as usize].intersects(aabb))
+    }
+}
+
+/// Sorts the occluders near `light` into its bins in each of `views`.
+fn fill_bins(
+    light: &ExtractedPointLight,
+    views: &[(RetainedViewEntity, &RenderLayers, bool, Aabb2d)],
+    bins: &mut BinBuffers,
+    occluders: &[(
+        Entity,
+        &ExtractedOccluder,
+        &RoundOccluderIndex,
+        &PolyOccluderIndex,
+    )],
+    grid: &OccluderGrid,
+    nearby: &mut Vec<u32>,
+) {
+    // Each visible view's bins, and whether the current occluder reaches the light there.
+    let mut view_bins: Vec<_> = bins
+        .views
+        .iter_mut()
+        .filter_map(|(view, bin)| {
+            let (_, layers, soft_shadows, aabb) = views.iter().find(|v| v.0 == *view)?;
+            Some((bin, *layers, *soft_shadows, *aabb, false))
+        })
+        .collect();
+
+    let bounds = views
+        .iter()
+        .skip(1)
+        .fold(views[0].3, |bounds, view| bounds.merge(&view.3));
+    grid.query(&bounds, nearby);
+
+    for &i in nearby.iter() {
+        let (_, occluder, round_index, poly_index) = occluders[i as usize];
+        if !light.render_layers.intersects(&occluder.render_layers) {
+            continue;
+        }
+
+        let mut any_soft_shadows = false;
+        let mut any_view = false;
+        for (_, layers, soft_shadows, aabb, hit) in &mut view_bins {
+            *hit = occluder.aabb.intersects(aabb) && layers.intersects(&occluder.render_layers);
+            any_soft_shadows |= *hit && *soft_shadows;
+            any_view |= *hit;
+        }
+        if !any_view {
+            continue;
+        }
+
+        let mut add = |data: &OccluderData| {
+            for (bin, .., hit) in &mut view_bins {
+                if *hit {
+                    bin.add_occluder(data);
+                }
+            }
+        };
+
+        if let Occluder2dShape::RoundRectangle {
+            half_width,
+            half_height,
+            radius,
+        } = occluder.shape
+        {
+            let Some(occluder_index) = round_index.0 else {
+                continue;
+            };
+
+            let vertices = vec![
+                vec2(-half_width - radius, -half_height - radius),
+                vec2(-half_width - radius, half_height + radius),
+                vec2(half_width + radius, half_height + radius),
+                vec2(half_width + radius, -half_height - radius),
+            ];
+
+            let light_pos = Vec2::from_angle(-occluder.rot).rotate(light.pos - occluder.pos);
+
+            let aabb = Aabb2d {
+                min: vec2(-half_width - radius, -half_height - radius),
+                max: vec2(half_width + radius, half_height + radius),
+            };
+
+            let isometry = Isometry2d {
+                translation: occluder.pos,
+                rotation: Rot2::radians(occluder.rot),
+            };
+
+            let vertices = translate_vertices(vertices, isometry.translation, isometry.rotation);
+
+            let closest = aabb.closest_point(light_pos);
+            let light_inside_occluder = closest == light_pos;
+
+            push_vertices(
+                &mut add,
+                &vertices,
+                light.pos,
+                light.core.radius,
+                0,
+                occluder_index.index as u32,
+                closest.distance(light_pos),
+                light_inside_occluder,
+                false,
+                any_soft_shadows,
+                true,
+            );
+        } else {
+            let Some(occluder_index) = poly_index.occluder else {
+                continue;
+            };
+
+            let Some(vertex_index) = poly_index.vertices else {
+                continue;
+            };
+
+            let vertices = occluder.vertices();
+
+            let light_inside_occluder = matches!(occluder.shape, Occluder2dShape::Polygon { .. })
+                && point_inside_poly(
+                    light.pos,
+                    &vertices,
+                    occluder.aabb,
+                    occluder.shape.is_concave(),
+                );
+
+            let closest = occluder.aabb.closest_point(light.pos);
+
+            push_vertices(
+                &mut add,
+                &vertices,
+                light.pos,
+                light.core.radius,
+                vertex_index.index as u32,
+                occluder_index.index as u32,
+                closest.distance(light.pos),
+                light_inside_occluder,
+                true,
+                any_soft_shadows,
+                occluder.shape.is_concave(),
+            );
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -600,7 +795,7 @@ struct Vertex {
 }
 
 fn push_vertices(
-    mut bins: Vec<&mut BinBuffer>,
+    add: &mut impl FnMut(&OccluderData),
     occluder_vertices: &[Vec2],
     light_pos: Vec2,
     light_radius: f32,
@@ -618,21 +813,17 @@ fn push_vertices(
     };
 
     if !poly && rev {
-        bins.iter_mut().for_each(|bins| {
-            bins.add_occluder(&OccluderData {
-                pointer: OccluderPointer {
-                    index,
-                    distance,
-                    ..default()
-                },
-                min_angle: 0.0,
-                angle: TAU,
-            })
+        add(&OccluderData {
+            pointer: OccluderPointer {
+                index,
+                distance,
+                ..default()
+            },
+            min_angle: 0.0,
+            angle: TAU,
         });
         return;
     }
-    // info!("pushing vertices: {occluder_vertices:?}");
-    // info!("start vertex: {start_vertex}");
 
     let vertices = occluder_vertices.iter().enumerate().map(|(i, v)| Vertex {
         index: i as u32,
@@ -669,21 +860,12 @@ fn push_vertices(
         }
     }
 
-    // info!("");
-    // info!("---------");
     let mut push_slice = |slice: &OccluderSlice, vertices: &[Vertex]| {
         if slice.length > 1 {
             let rev: u32 = match rev {
                 true => 1,
                 false => 0,
             };
-
-            // info!("pushing {slice:?}! poly: {poly}");
-
-            // info!(
-            //     "slice start: {}, slice length: {}",
-            //     slice.start_vertex, slice.length
-            // );
 
             let min_v = (rev << 29) | (slice.start_vertex + start_vertex);
             let length = slice.length;
@@ -739,9 +921,7 @@ fn push_vertices(
                         angle: slice.angle + angle_left + angle_right,
                     };
 
-                    bins.iter_mut().for_each(|bins| {
-                        bins.add_occluder(&data);
-                    });
+                    add(&data);
                 }
                 Some(split) => {
                     let data1 = OccluderData {
@@ -768,10 +948,8 @@ fn push_vertices(
                         angle: slice.angle + angle_left + angle_right,
                     };
 
-                    bins.iter_mut().for_each(|bins| {
-                        bins.add_occluder(&data1);
-                        bins.add_occluder(&data2);
-                    });
+                    add(&data1);
+                    add(&data2);
                 }
             }
         }
@@ -785,17 +963,17 @@ fn push_vertices(
             if let Some(last) = last {
                 let loops = (vertex.angle - last.angle).abs() > PI;
 
-                // if the next vertex is decreasing
+                // The next vertex is decreasing.
                 if (!loops && vertex.angle <= last.angle) || (loops && vertex.angle >= last.angle) {
                     push_slice(&slice, &vertices);
                     slice = OccluderSlice::new(index, vertex);
                 }
-                // if the next vertex is increasing, simple case
+                // The next vertex is increasing.
                 else if !loops && vertex.angle > last.angle {
                     slice.length += 1;
                     slice.angle += vertex.angle - last.angle;
                 }
-                // if the next vertex is increasing and loops over
+                // The next vertex is increasing and crosses the atan2 seam.
                 else {
                     if poly {
                         slice.split = Some(slice.length);

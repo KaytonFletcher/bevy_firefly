@@ -6,7 +6,10 @@
 use std::any::TypeId;
 
 use bevy::{
-    camera::visibility::{SetViewVisibility, VisibilitySystems, VisibleEntities},
+    camera::visibility::{
+        SetViewVisibility, VisibilitySystems, VisibleEntities, check_visibility_cpu_culling,
+        check_visibility_gpu_culling,
+    },
     prelude::*,
     shape::{Aabb2d, BoundingVolume, IntersectsVolume},
 };
@@ -53,11 +56,14 @@ impl Plugin for VisibilityPlugin {
 
         app.add_systems(Update, occluder_aabb);
 
+        // Bevy's visibility systems clear `VisibleEntities`, so these must run after them.
         app.add_systems(
             PostUpdate,
             (mark_visible_lights, mark_visible_occluders)
                 .chain()
-                .in_set(VisibilitySystems::CheckVisibility),
+                .in_set(VisibilitySystems::CheckVisibility)
+                .after(check_visibility_cpu_culling)
+                .after(check_visibility_gpu_culling),
         );
     }
 }
@@ -128,6 +134,13 @@ fn mark_visible_lights(
         }
 
         visibility_timer.0.tick(time.delta());
+    }
+
+    // Bevy requires each list in `VisibleEntities` to be sorted.
+    for (.., visible_entities) in camera_rects.iter_mut() {
+        visible_entities
+            .get_mut(TypeId::of::<PointLight2d>())
+            .sort_unstable();
     }
 }
 
