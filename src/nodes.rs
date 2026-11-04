@@ -4,6 +4,7 @@ use bevy::{
     ecs::{query::QueryItem, system::lifetimeless::Read},
     prelude::*,
     render::{
+        diagnostic::RecordDiagnostics,
         render_phase::{ViewBinnedRenderPhases, ViewSortedRenderPhases},
         render_resource::{
             BindGroupEntries, PipelineCache, RenderPassColorAttachment, RenderPassDescriptor,
@@ -65,6 +66,9 @@ pub fn create_lightmap(
     } else {
         &lightmap_texture.0.default_view
     };
+    let diagnostics = render_context.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
+
     let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("lightmap pass"),
         color_attachments: &[Some(RenderPassColorAttachment {
@@ -76,9 +80,13 @@ pub fn create_lightmap(
         ..default()
     });
 
+    let pass_span = diagnostics.pass_span(&mut render_pass, "firefly_lightmap");
+
     if let Err(err) = lightmap_phase.render(&mut render_pass, world, view_entity) {
-        error!("Error encountered while rendering the stencil phase {err:?}");
+        error!("Error encountered while rendering the lightmap phase {err:?}");
     }
+
+    pass_span.end(&mut render_pass);
 }
 
 pub fn apply_lightmap(
@@ -175,6 +183,9 @@ pub fn apply_lightmap(
         )
     };
 
+    let diagnostics = render_context.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
+
     let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("apply lightmap pass"),
         color_attachments: &[Some(RenderPassColorAttachment {
@@ -186,9 +197,13 @@ pub fn apply_lightmap(
         ..default()
     });
 
+    let pass_span = diagnostics.pass_span(&mut render_pass, "firefly_apply_lightmap");
+
     render_pass.set_render_pipeline(render_pipeline);
     render_pass.set_bind_group(0, &bind_group, &[]);
     render_pass.draw(0..3, 0..1);
+
+    pass_span.end(&mut render_pass);
 }
 
 pub fn sprite(
@@ -206,6 +221,9 @@ pub fn sprite(
     let Some(sprite_phase) = sprite_phases.get(&view.retained_view_entity) else {
         return;
     };
+
+    let diagnostics = render_context.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
 
     let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("stencil pass"),
@@ -226,7 +244,11 @@ pub fn sprite(
         ..default()
     });
 
+    let pass_span = diagnostics.pass_span(&mut render_pass, "firefly_sprite_stencil");
+
     if let Err(err) = sprite_phase.render(&mut render_pass, world, view_entity) {
         error!("Error encountered while rendering the stencil phase {err:?}");
     }
+
+    pass_span.end(&mut render_pass);
 }
