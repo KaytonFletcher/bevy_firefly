@@ -126,21 +126,16 @@ fn init_lightmap_creation_pipeline(
         ),
     );
 
+    // The vertex shader tonemaps each light's color, so it needs the LUT too.
     let tonemapping_lut_entries = get_lut_bind_group_layout_entries();
     let lut_layout = BindGroupLayoutDescriptor::new(
-        "sprite_view_layout",
+        "light_view_layout",
         &BindGroupLayoutEntries::with_indices(
             ShaderStages::VERTEX_FRAGMENT,
             (
                 (0, uniform_buffer::<ViewUniform>(true)),
-                (
-                    1,
-                    tonemapping_lut_entries[0].visibility(ShaderStages::FRAGMENT),
-                ),
-                (
-                    2,
-                    tonemapping_lut_entries[1].visibility(ShaderStages::FRAGMENT),
-                ),
+                (1, tonemapping_lut_entries[0]),
+                (2, tonemapping_lut_entries[1]),
             ),
         ),
     );

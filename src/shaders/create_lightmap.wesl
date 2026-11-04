@@ -61,6 +61,7 @@ const PIDIV2: f32 = 1.57079632679489661923132169163975144;
 struct VertexOutput {
     @builtin(position) position: vec4f,
     @location(0) @interpolate(flat) slot: u32,
+    @location(1) @interpolate(flat) color: vec4f,
 }
 
 // Draws a quad over the light's bounds, so pixels the light can't reach are never shaded.
@@ -91,7 +92,12 @@ fn vertex(
     var quad = array(0u, 1u, 2u, 2u, 1u, 3u);
     let corner = quad[vertex_index];
     let pixel = select(lo, hi, vec2(corner & 1u, corner >> 1u) == vec2(1u));
-    return VertexOutput(vec4f(uv_to_ndc(pixel / config.lightmap_size), 0.0, 1.0), slot);
+    // Tonemapping the light's color once here saves a LUT sample per pixel.
+    var color = light.color;
+@if(TONEMAP_IN_SHADER)
+    color = tonemapping::tone_mapping(color, view.color_grading);
+
+    return VertexOutput(vec4f(uv_to_ndc(pixel / config.lightmap_size), 0.0, 1.0), slot, color);
 }
 
 fn set_light(slot: u32) {
@@ -120,10 +126,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4f {
     let normal = textureLoad(normal_map, vec2<i32>(uv * vec2<f32>(textureDimensions(normal_map))), 0);
     let stencil = textureSampleLevel(sprite_stencil, texture_sampler, uv, 0.0);
 
-    var light_color = light.color;
-
-@if(TONEMAP_IN_SHADER)
-    light_color = tonemapping::tone_mapping(light_color, view.color_grading);
+    let light_color = in.color;
 
     var res: vec4f;
     var angle_multi = 1.0;
