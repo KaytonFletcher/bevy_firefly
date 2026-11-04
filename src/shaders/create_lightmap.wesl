@@ -3,7 +3,7 @@ import bevy_core_pipeline::tonemapping;
 
 import package::shaders::types::{
     view, PointLight, PolyOccluder, RoundOccluder, OccluderPointer,
-    FireflyConfig, BinIndices, N_BINS,
+    FireflyConfig, N_BINS, BIN_BLOCK_SIZE,
 };
 
 import package::shaders::utils::{
@@ -23,8 +23,10 @@ var texture_sampler: sampler;
 @group(1) @binding(1)
 var<storage> lights: array<PointLight>;
 
-// The light being drawn. Set at the start of both entry points from the instance index.
+// The light being drawn, and the start of its block in `bins`.
+// Set at the start of both entry points, from the instance index.
 var<private> light_index: u32;
+var<private> bin_block: u32;
 
 @group(1) @binding(2)
 var<storage> round_occluders: array<RoundOccluder>;
@@ -38,8 +40,10 @@ var<storage> vertices: array<vec2f>;
 @group(1) @binding(5)
 var<storage> occluders: array<OccluderPointer>;
 
+// One block of BIN_BLOCK_SIZE per light: its index in `lights`, then where each of
+// its bins starts in `occluders`, then where the last one ends.
 @group(1) @binding(6)
-var<storage> bin_indices: BinIndices;
+var<storage> bins: array<u32>;
 
 @group(1) @binding(7)
 var sprite_stencil: texture_2d<f32>;
@@ -56,16 +60,16 @@ const PIDIV2: f32 = 1.57079632679489661923132169163975144;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
-    @location(0) @interpolate(flat) light_index: u32,
+    @location(0) @interpolate(flat) slot: u32,
 }
 
 // Draws a quad over the light's bounds, so pixels the light can't reach are never shaded.
 @vertex
 fn vertex(
     @builtin(vertex_index) vertex_index: u32,
-    @builtin(instance_index) instance_index: u32,
+    @builtin(instance_index) slot: u32,
 ) -> VertexOutput {
-    light_index = instance_index;
+    set_light(slot);
     let light = lights[light_index];
 
     // Map the corners of the light's world bounds to lightmap pixels,
@@ -87,12 +91,17 @@ fn vertex(
     var quad = array(0u, 1u, 2u, 2u, 1u, 3u);
     let corner = quad[vertex_index];
     let pixel = select(lo, hi, vec2(corner & 1u, corner >> 1u) == vec2(1u));
-    return VertexOutput(vec4f(uv_to_ndc(pixel / config.lightmap_size), 0.0, 1.0), light_index);
+    return VertexOutput(vec4f(uv_to_ndc(pixel / config.lightmap_size), 0.0, 1.0), slot);
+}
+
+fn set_light(slot: u32) {
+    bin_block = slot * BIN_BLOCK_SIZE;
+    light_index = bins[bin_block];
 }
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4f {
-    light_index = in.light_index;
+    set_light(in.slot);
     let light = lights[light_index];
     let position = in.position;
 
@@ -174,8 +183,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4f {
     var bin = u32(floor(((atan2(pos.y - light.pos.y, pos.x - light.pos.x) + PI) / PI2) * f32(N_BINS)));
     bin = clamp(bin, 0, N_BINS-1);
 
-    let left = bin_indices.indices[bin]; 
-    let right = bin_indices.indices[bin + 1];
+    let left = bins[bin_block + 1 + bin];
+    let right = bins[bin_block + 2 + bin];
 
     // if left >= right {
         // return vec4f(1.0, 0.0, 0.0, 1.0);

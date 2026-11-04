@@ -19,8 +19,7 @@ use bevy::{
     render::{
         Render, RenderApp, RenderStartup, RenderSystems,
         render_resource::{
-            BindingResource, BufferUsages, RawBufferVec, ShaderType, StorageBuffer,
-            encase::private::WriteInto,
+            BindingResource, BufferUsages, RawBufferVec, ShaderType, encase::private::WriteInto,
         },
         renderer::{RenderDevice, RenderQueue},
         view::RetainedViewEntity,
@@ -66,6 +65,7 @@ impl Plugin for BuffersPlugin {
         render_app.init_resource::<BufferManager<UniformOccluder>>();
         render_app.init_resource::<BufferManager<UniformPointLight>>();
         render_app.init_resource::<VertexBuffer>();
+        render_app.init_resource::<ViewBins>();
     }
 }
 
@@ -483,103 +483,40 @@ pub const N_BINS_FLOAT: f32 = 256.0;
 #[derive(Component, Default)]
 pub struct BinBuffers(pub HashMap<RetainedViewEntity, BinBuffer>);
 
-/// A struct containing sets of bins of occluders for faster iteration.
+/// Occluders near a light, sorted into [`N_BINS`] angular bins around it.
 /// This is the most important acceleration structure used by Firefly. It is used in a custom
 /// type of angular sweep with BVH-inspired elements.
 pub struct BinBuffer {
-    /// List of all Occluders that will be written to the GPU.
-    buffer: RawBufferVec<OccluderPointer>,
-    /// Indices describing where each bin starts, written to the GPU. The extra value at the end is the maximum index / length.  
-    bin_indices: StorageBuffer<BinIndices>,
-    /// Data stored on the CPU.
+    /// Whether the light was visible in this view this frame.
+    pub visible: bool,
+    /// Heaps pop the closest occluder first, so each bin is sorted by distance.
     occluders: [BinaryHeap<OccluderPointer>; N_BINS],
-}
-
-/// Wrapper for the bin indices, so it can impl Default.
-#[repr(C)]
-#[derive(Pod, Zeroable, Clone, Copy, ShaderType)]
-pub struct BinIndices {
-    indices: [u32; N_BINS + 1],
-}
-
-impl Default for BinIndices {
-    fn default() -> Self {
-        BinIndices {
-            indices: [0; N_BINS + 1],
-        }
-    }
 }
 
 impl Default for BinBuffer {
     fn default() -> Self {
         Self {
-            buffer: RawBufferVec::<OccluderPointer>::new(BufferUsages::STORAGE),
-            bin_indices: StorageBuffer::<BinIndices>::default(),
+            visible: false,
             occluders: array::from_fn(|_| default()),
         }
     }
 }
 
 impl BinBuffer {
-    /// Get the binding of the bins. It is guaranteed to exist.
-    pub fn bin_binding(&self) -> BindingResource<'_> {
-        self.buffer.binding().unwrap()
-    }
-
-    /// Get the binding of the end index of each bin. It is guaranteed to exist.
-    pub fn bin_indices_binding(&self) -> BindingResource<'_> {
-        self.bin_indices.binding().unwrap()
-    }
-
-    /// Write this buffer's data to the GPU. This function also sorts the
-    /// occluders by distance enabling early-stopping in GPU checks.
-    pub fn write(&mut self, device: &RenderDevice, queue: &RenderQueue) {
-        let mut bin_indices = [0; N_BINS + 1];
-
-        let mut count = 1;
-
-        let values = self.buffer.values_mut();
-
-        for (index, bin) in self.occluders.iter_mut().enumerate() {
-            bin_indices[index] = count as u32;
-            count += bin.len();
-            // info!("{:?}", &bin.clone().into_sorted_vec());
-            // values.extend_from_slice(&bin.clone().into_sorted_vec());
-
-            loop {
-                let Some(x) = bin.pop() else { break };
-                values.push(x);
-            }
-        }
-        bin_indices[N_BINS] = count as u32;
-
-        self.buffer.write_buffer(device, queue);
-
-        self.bin_indices.set(BinIndices {
-            indices: bin_indices,
-        });
-        self.bin_indices.write_buffer(device, queue);
-    }
-
-    /// Clear the buffer and add one empty set of bins.
+    /// Empty the bins and mark the light as visible.
     pub fn reset(&mut self) {
-        self.buffer.clear();
-        self.buffer.push(OccluderPointer::default());
-
+        self.visible = true;
         for bin in self.occluders.iter_mut() {
             bin.clear();
         }
     }
 
-    // const SCALE: f32 = N_BINS_FLOAT / TAU;
     /// Add an occluder to this buffer. Or a set of edges, in case of a polygonal occluder.
     pub fn add_occluder(&mut self, data: &OccluderData) {
         if data.angle.ceil() >= TAU {
             self.add_to_bins(0, N_BINS - 1, data.pointer);
             return;
         }
-
-        // info!("init min angle: {}", edge.min_angle);
 
         let min_angle = if data.min_angle < -PI {
             data.min_angle + TAU
@@ -590,9 +527,6 @@ impl BinBuffer {
         let min_bin = (((min_angle + PI) / TAU) * N_BINS_FLOAT).floor() as usize;
         let n_bins = ((data.angle / TAU) * N_BINS_FLOAT).ceil() as usize;
 
-        // info!("min bin: {min_bin}, n_bins: {n_bins}");
-
-        // self.add_to_bins(0, N_BINS - 1, edge.pointer);
         if min_bin + n_bins >= N_BINS {
             self.add_to_bins(min_bin, N_BINS - 1, data.pointer);
             self.add_to_bins(0, min_bin + n_bins - N_BINS, data.pointer);
@@ -602,12 +536,79 @@ impl BinBuffer {
     }
 
     fn add_to_bins(&mut self, min_bin: usize, max_bin: usize, pointer: OccluderPointer) {
-        // info!("writing buffers {min_bin} to {max_bin}");
         for index in min_bin..(max_bin + 1) {
             self.occluders[index].push(pointer);
         }
     }
 }
+
+/// The size of one light's block in [`ViewBins::bins`]: its light index, then the start of
+/// each bin, then the end of the last bin.
+pub const BIN_BLOCK_SIZE: usize = N_BINS + 2;
+
+/// The bins of every light visible in a view, in two GPU buffers, so a view needs one bind group.
+pub struct ViewBinBuffers {
+    /// Every light's bins, one after another. Index 0 is unused.
+    occluders: RawBufferVec<OccluderPointer>,
+    /// One block of [`BIN_BLOCK_SIZE`] per light. See [`BIN_BLOCK_SIZE`].
+    bins: RawBufferVec<u32>,
+}
+
+impl Default for ViewBinBuffers {
+    fn default() -> Self {
+        let mut res = Self {
+            occluders: RawBufferVec::new(BufferUsages::STORAGE),
+            bins: RawBufferVec::new(BufferUsages::STORAGE),
+        };
+        res.occluders.set_label("view occluder bins".into());
+        res.bins.set_label("view bin indices".into());
+        res.clear();
+        res
+    }
+}
+
+impl ViewBinBuffers {
+    pub fn clear(&mut self) {
+        self.occluders.clear();
+        self.occluders.push(OccluderPointer::default());
+        self.bins.clear();
+    }
+
+    pub fn n_lights(&self) -> usize {
+        self.bins.len() / BIN_BLOCK_SIZE
+    }
+
+    /// Append a light's bins, emptying them. Returns the light's slot.
+    pub fn push(&mut self, light_index: u32, bins: &mut BinBuffer) -> u32 {
+        let slot = self.n_lights() as u32;
+        self.bins.push(light_index);
+        for bin in bins.occluders.iter_mut() {
+            self.bins.push(self.occluders.len() as u32);
+            while let Some(pointer) = bin.pop() {
+                self.occluders.push(pointer);
+            }
+        }
+        self.bins.push(self.occluders.len() as u32);
+        slot
+    }
+
+    pub fn write(&mut self, device: &RenderDevice, queue: &RenderQueue) {
+        self.occluders.write_buffer(device, queue);
+        self.bins.write_buffer(device, queue);
+    }
+
+    pub fn occluders_binding(&self) -> BindingResource<'_> {
+        self.occluders.binding().unwrap()
+    }
+
+    pub fn bins_binding(&self) -> BindingResource<'_> {
+        self.bins.binding().unwrap()
+    }
+}
+
+/// The [`ViewBinBuffers`] of each view.
+#[derive(Resource, Default, Deref, DerefMut)]
+pub struct ViewBins(pub HashMap<RetainedViewEntity, ViewBinBuffers>);
 
 /// CPU struct describing an occluder or edge.
 #[derive(Clone)]

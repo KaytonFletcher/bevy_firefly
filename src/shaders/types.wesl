@@ -82,9 +82,6 @@ struct FireflyConfig {
     lightmap_size: vec2<f32>,
 }
 
-// Should correspond to the value in buffers.rs!
+// Should correspond to the values in buffers.rs!
 const N_BINS: u32 = 256;
-
-struct BinIndices {
-    indices: array<u32, N_BINS + 1>,
-}
+const BIN_BLOCK_SIZE: u32 = N_BINS + 2;

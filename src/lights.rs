@@ -348,12 +348,14 @@ pub(crate) struct LightBatches(pub HashMap<(RetainedViewEntity, Entity), LightBa
 
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub(crate) struct LightBatch {
-    pub id: Entity,
+    /// The light's slot in its view's bins, and the instance index it's drawn with.
+    pub slot: u32,
 }
 
+/// The bind group of each view, shared by all its lights.
 #[derive(Resource, Default)]
 pub(crate) struct LightBindGroups {
-    pub values: HashMap<Entity, HashMap<RetainedViewEntity, BindGroup>>,
+    pub values: HashMap<RetainedViewEntity, BindGroup>,
 }
 
 #[derive(Component)]
@@ -470,49 +472,48 @@ impl<P: PhaseItem> RenderCommand<P> for SetLightTextureBindGroup {
         item: &P,
         (view, view_uniform_offset, lut): ROQueryItem<'w, '_, Self::ViewQuery>,
         _entity: Option<()>,
-        (image_bind_groups, batches): SystemParamItem<'w, '_, Self::Param>,
+        (bind_groups, batches): SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
-        let image_bind_groups = image_bind_groups.into_inner();
-        let Some(batch) = batches.get(&(view.retained_view_entity, item.entity())) else {
+        if !batches.contains_key(&(view.retained_view_entity, item.entity())) {
+            return RenderCommandResult::Skip;
+        }
+        let Some(bind_group) = bind_groups
+            .into_inner()
+            .values
+            .get(&view.retained_view_entity)
+        else {
             return RenderCommandResult::Skip;
         };
 
         pass.set_bind_group(0, &lut.0, &[view_uniform_offset.offset]);
-        pass.set_bind_group(
-            1,
-            image_bind_groups
-                .values
-                .get(&batch.id)
-                .unwrap()
-                .get(&view.retained_view_entity)
-                .unwrap(),
-            &[],
-        );
+        pass.set_bind_group(1, bind_group, &[]);
 
         RenderCommandResult::Success
     }
 }
 
-/// Draws the light's quad. The instance index is the light's slot in the light buffer.
+/// Draws the light's quad, with its slot in the view's bins as the instance index.
 pub(crate) struct DrawLightBatch;
 impl<P: PhaseItem> RenderCommand<P> for DrawLightBatch {
-    type Param = ();
-    type ViewQuery = ();
-    type ItemQuery = Read<LightIndex>;
+    type Param = SRes<LightBatches>;
+    type ViewQuery = Read<ExtractedView>;
+    type ItemQuery = ();
 
     fn render<'w>(
-        _: &P,
-        _: ROQueryItem<'w, '_, Self::ViewQuery>,
-        light_index: Option<&'w LightIndex>,
-        _: SystemParamItem<'w, '_, Self::Param>,
+        item: &P,
+        view: ROQueryItem<'w, '_, Self::ViewQuery>,
+        _entity: Option<()>,
+        batches: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
-        let Some(BufferIndex { index, .. }) = light_index.and_then(|i| i.0) else {
+        let Some(batch) = batches
+            .into_inner()
+            .get(&(view.retained_view_entity, item.entity()))
+        else {
             return RenderCommandResult::Skip;
         };
-        let index = index as u32;
-        pass.draw(0..6, index..index + 1);
+        pass.draw(0..6, batch.slot..batch.slot + 1);
         RenderCommandResult::Success
     }
 }
