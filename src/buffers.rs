@@ -14,6 +14,7 @@ use std::{
 };
 
 use bevy::{
+    camera::visibility::RenderLayers,
     platform::collections::HashMap,
     prelude::*,
     render::{
@@ -24,6 +25,7 @@ use bevy::{
         renderer::{RenderDevice, RenderQueue},
         view::RetainedViewEntity,
     },
+    shape::Aabb2d,
 };
 use bytemuck::{NoUninit, Pod, Zeroable};
 
@@ -479,9 +481,28 @@ impl<T: ShaderType + WriteInto + Default + NoUninit> BufferManager<T> {
 pub const N_BINS: usize = 256;
 pub const N_BINS_FLOAT: f32 = 256.0;
 
-/// A component that each light has, containing the [BinBuffer]s for each camera view.
+/// A light's [`BinBuffer`] for each view, and what they were built from.
 #[derive(Component, Default)]
-pub struct BinBuffers(pub HashMap<RetainedViewEntity, BinBuffer>);
+pub struct BinBuffers {
+    pub views: HashMap<RetainedViewEntity, BinBuffer>,
+    /// What the bins were last built from.
+    pub key: Option<BinKey>,
+    /// The frame the bins were last built or reused on.
+    pub frame: u32,
+}
+
+/// Everything about a light and its views that its bins depend on, apart from occluders.
+#[derive(PartialEq)]
+pub struct BinKey {
+    pub pos: Vec2,
+    pub radius: f32,
+    pub core_radius: f32,
+    pub cast_shadows: bool,
+    pub layers: RenderLayers,
+    /// For each view the light is visible in: its bounds there, the view's layers,
+    /// and whether the view has soft shadows.
+    pub views: Vec<(RetainedViewEntity, Aabb2d, RenderLayers, bool)>,
+}
 
 /// Occluders near a light, sorted into [`N_BINS`] angular bins around it.
 /// This is the most important acceleration structure used by Firefly. It is used in a custom
@@ -491,6 +512,10 @@ pub struct BinBuffer {
     pub visible: bool,
     /// Heaps pop the closest occluder first, so each bin is sorted by distance.
     occluders: [BinaryHeap<OccluderPointer>; N_BINS],
+    /// Every bin's occluders, closest first, one bin after another. Filled by [`Self::finish`].
+    sorted: Vec<OccluderPointer>,
+    /// Where each bin starts in `sorted`, then where the last one ends.
+    starts: [u32; N_BINS + 1],
 }
 
 impl Default for BinBuffer {
@@ -498,17 +523,30 @@ impl Default for BinBuffer {
         Self {
             visible: false,
             occluders: array::from_fn(|_| default()),
+            sorted: vec![],
+            starts: [0; N_BINS + 1],
         }
     }
 }
 
 impl BinBuffer {
-    /// Empty the bins and mark the light as visible.
+    /// Empty the bins.
     pub fn reset(&mut self) {
-        self.visible = true;
         for bin in self.occluders.iter_mut() {
             bin.clear();
         }
+    }
+
+    /// Sort the added occluders into `sorted`.
+    pub fn finish(&mut self) {
+        self.sorted.clear();
+        for (bin, start) in self.occluders.iter_mut().zip(&mut self.starts) {
+            *start = self.sorted.len() as u32;
+            while let Some(pointer) = bin.pop() {
+                self.sorted.push(pointer);
+            }
+        }
+        self.starts[N_BINS] = self.sorted.len() as u32;
     }
 
     /// Add an occluder to this buffer. Or a set of edges, in case of a polygonal occluder.
@@ -578,17 +616,14 @@ impl ViewBinBuffers {
         self.bins.len() / BIN_BLOCK_SIZE
     }
 
-    /// Append a light's bins, emptying them. Returns the light's slot.
-    pub fn push(&mut self, light_index: u32, bins: &mut BinBuffer) -> u32 {
+    /// Append a light's finished bins. Returns the light's slot.
+    pub fn push(&mut self, light_index: u32, bins: &BinBuffer) -> u32 {
         let slot = self.n_lights() as u32;
-        self.bins.push(light_index);
-        for bin in bins.occluders.iter_mut() {
-            self.bins.push(self.occluders.len() as u32);
-            while let Some(pointer) = bin.pop() {
-                self.occluders.push(pointer);
-            }
-        }
-        self.bins.push(self.occluders.len() as u32);
+        let offset = self.occluders.len() as u32;
+        let indices = self.bins.values_mut();
+        indices.push(light_index);
+        indices.extend(bins.starts.iter().map(|start| offset + start));
+        self.occluders.values_mut().extend_from_slice(&bins.sorted);
         slot
     }
 

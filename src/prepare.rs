@@ -5,7 +5,10 @@ use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use crate::{
     CombinedLightMapTextures, NormalMapTexture, SpriteStencilTexture,
-    buffers::{BinBuffers, BufferManager, OccluderData, OccluderPointer, VertexBuffer, ViewBins},
+    buffers::{
+        BinBuffers, BinKey, BufferIndex, BufferManager, OccluderData, OccluderPointer,
+        VertexBuffer, ViewBins,
+    },
     data::{
         CombinationMode, ExtractedCombineLightmapTo, ExtractedCombinedLightmaps,
         ExtractedWorldData, LightmapSize, NormalMode,
@@ -29,6 +32,7 @@ use bevy::{
     camera::visibility::RenderLayers,
     core_pipeline::tonemapping::{Tonemapping, TonemappingLuts, get_lut_bindings},
     math::Affine3A,
+    platform::collections::HashMap,
     prelude::*,
     render::{
         Render, RenderApp, RenderSystems,
@@ -40,7 +44,7 @@ use bevy::{
         },
         renderer::{RenderDevice, RenderQueue},
         texture::{FallbackImage, GpuImage, TextureCache},
-        view::{ExtractedView, ViewTarget, ViewUniforms},
+        view::{ExtractedView, RetainedViewEntity, ViewTarget, ViewUniforms},
     },
     shape::{Aabb2d, BoundingVolume, IntersectsVolume},
     tasks::{ComputeTaskPool, ParallelSliceMut},
@@ -75,6 +79,7 @@ impl Plugin for PreparePlugin {
             specialize_light_application_pipeline.in_set(RenderSystems::Prepare),
         );
 
+        render_app.init_resource::<OccluderHistory>();
         render_app.add_systems(Render, prepare_data.in_set(RenderSystems::Prepare));
         // `prepare_data` reads the config and textures these insert, for the same frame.
         render_app.add_systems(
@@ -330,7 +335,12 @@ pub(crate) fn prepare_data(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     mut lights: Query<(Entity, &ExtractedPointLight, &LightIndex, &mut BinBuffers)>,
-    occluders: Query<(&ExtractedOccluder, &RoundOccluderIndex, &PolyOccluderIndex)>,
+    occluders: Query<(
+        Entity,
+        &ExtractedOccluder,
+        &RoundOccluderIndex,
+        &PolyOccluderIndex,
+    )>,
     cameras: Query<(
         &ExtractedView,
         &RenderLayers,
@@ -350,22 +360,28 @@ pub(crate) fn prepare_data(
     light_buffer: Res<BufferManager<UniformPointLight>>,
     vertices: Res<VertexBuffer>,
     pipeline_cache: Res<PipelineCache>,
+    mut history: ResMut<OccluderHistory>,
+    mut frame: Local<u32>,
 ) {
     batches.clear();
+    *frame = frame.wrapping_add(1);
+    let frame = *frame;
 
     let mut lights: Vec<_> = lights.iter_mut().collect();
 
     let occluders: Vec<_> = occluders.iter().collect();
-    let aabbs: Vec<_> = occluders.iter().map(|(o, ..)| o.aabb).collect();
+    let aabbs: Vec<_> = occluders.iter().map(|(_, o, ..)| o.aabb).collect();
     let occluder_grid = OccluderGrid::new(&aabbs);
+    let changes = history.update(&occluders, frame);
 
     lights.par_splat_map_mut(ComputeTaskPool::get(), None, |_, lights| {
         let mut nearby = vec![];
         for (_, light, light_index, bins) in lights {
-            for bin in bins.0.values_mut() {
+            for bin in bins.views.values_mut() {
                 bin.visible = false;
             }
             if light_index.0.is_none() {
+                bins.key = None;
                 continue;
             }
 
@@ -395,149 +411,55 @@ pub(crate) fn prepare_data(
                         return None;
                     }
 
-                    let view = camera.0.retained_view_entity;
-                    bins.0.entry(view).or_default().reset();
-
                     let aabb = Aabb2d {
                         min: light_rect.min,
                         max: light_rect.max,
                     };
-                    Some((view, camera.1, camera.7.soft_shadows, aabb))
+                    Some((
+                        camera.0.retained_view_entity,
+                        camera.1,
+                        camera.7.soft_shadows,
+                        aabb,
+                    ))
                 })
                 .collect::<Vec<_>>();
 
-            if views.is_empty() || !light.cast_shadows {
-                continue;
+            for (view, ..) in &views {
+                bins.views.entry(*view).or_default().visible = true;
             }
 
-            // Each visible view's bins, and whether the current occluder reaches the light there.
-            let mut view_bins: Vec<_> = bins
-                .0
-                .iter_mut()
-                .filter_map(|(view, bin)| {
-                    let (_, layers, soft_shadows, aabb) = views.iter().find(|v| v.0 == *view)?;
-                    Some((bin, *layers, *soft_shadows, *aabb, false))
-                })
-                .collect();
+            // Reuse last frame's bins if neither the light, its views,
+            // nor any occluder near it changed since.
+            let key = BinKey {
+                pos: light.pos,
+                radius: light.radius,
+                core_radius: light.core.radius,
+                cast_shadows: light.cast_shadows,
+                layers: light.render_layers.clone(),
+                views: views
+                    .iter()
+                    .map(|(view, layers, soft, aabb)| (*view, *aabb, (*layers).clone(), *soft))
+                    .collect(),
+            };
+            let reuse = bins.frame == frame.wrapping_sub(1)
+                && bins.key.as_ref() == Some(&key)
+                && !views
+                    .iter()
+                    .any(|view| changes.intersects(&view.3, &mut nearby));
+            bins.frame = frame;
+            if reuse {
+                continue;
+            }
+            bins.key = Some(key);
 
-            let bounds = views
-                .iter()
-                .skip(1)
-                .fold(views[0].3, |bounds, view| bounds.merge(&view.3));
-            occluder_grid.query(&bounds, &mut nearby);
-
-            for &i in &nearby {
-                let (occluder, round_index, poly_index) = occluders[i as usize];
-                if !light.render_layers.intersects(&occluder.render_layers) {
-                    continue;
-                }
-
-                let mut any_soft_shadows = false;
-                let mut any_view = false;
-                for (_, layers, soft_shadows, aabb, hit) in &mut view_bins {
-                    *hit = occluder.aabb.intersects(aabb)
-                        && layers.intersects(&occluder.render_layers);
-                    any_soft_shadows |= *hit && *soft_shadows;
-                    any_view |= *hit;
-                }
-                if !any_view {
-                    continue;
-                }
-
-                let mut add = |data: &OccluderData| {
-                    for (bin, .., hit) in &mut view_bins {
-                        if *hit {
-                            bin.add_occluder(data);
-                        }
-                    }
-                };
-
-                if let Occluder2dShape::RoundRectangle {
-                    half_width,
-                    half_height,
-                    radius,
-                } = occluder.shape
-                {
-                    let Some(occluder_index) = round_index.0 else {
-                        continue;
-                    };
-
-                    let vertices = vec![
-                        vec2(-half_width - radius, -half_height - radius),
-                        vec2(-half_width - radius, half_height + radius),
-                        vec2(half_width + radius, half_height + radius),
-                        vec2(half_width + radius, -half_height - radius),
-                    ];
-
-                    let light_pos =
-                        Vec2::from_angle(-occluder.rot).rotate(light.pos - occluder.pos);
-
-                    let aabb = Aabb2d {
-                        min: vec2(-half_width - radius, -half_height - radius),
-                        max: vec2(half_width + radius, half_height + radius),
-                    };
-
-                    let isometry = Isometry2d {
-                        translation: occluder.pos,
-                        rotation: Rot2::radians(occluder.rot),
-                    };
-
-                    let vertices =
-                        translate_vertices(vertices, isometry.translation, isometry.rotation);
-
-                    let closest = aabb.closest_point(light_pos);
-                    let light_inside_occluder = closest == light_pos;
-
-                    push_vertices(
-                        &mut add,
-                        &vertices,
-                        light.pos,
-                        light.core.radius,
-                        0,
-                        occluder_index.index as u32,
-                        closest.distance(light_pos),
-                        // 0.0,
-                        light_inside_occluder,
-                        false,
-                        any_soft_shadows,
-                        true,
-                    );
-                } else {
-                    let Some(occluder_index) = poly_index.occluder else {
-                        continue;
-                    };
-
-                    let Some(vertex_index) = poly_index.vertices else {
-                        continue;
-                    };
-
-                    let vertices = occluder.vertices();
-
-                    let light_inside_occluder =
-                        matches!(occluder.shape, Occluder2dShape::Polygon { .. })
-                            && point_inside_poly(
-                                light.pos,
-                                &vertices,
-                                occluder.aabb,
-                                occluder.shape.is_concave(),
-                            );
-
-                    let closest = occluder.aabb.closest_point(light.pos);
-
-                    push_vertices(
-                        &mut add,
-                        &vertices,
-                        light.pos,
-                        light.core.radius,
-                        vertex_index.index as u32,
-                        occluder_index.index as u32,
-                        closest.distance(light.pos),
-                        light_inside_occluder,
-                        true,
-                        any_soft_shadows,
-                        occluder.shape.is_concave(),
-                    );
-                }
+            for (view, ..) in &views {
+                bins.views.get_mut(view).unwrap().reset();
+            }
+            if light.cast_shadows && !views.is_empty() {
+                fill_bins(light, &views, bins, &occluders, &occluder_grid, &mut nearby);
+            }
+            for (view, ..) in &views {
+                bins.views.get_mut(view).unwrap().finish();
             }
         }
     });
@@ -551,7 +473,7 @@ pub(crate) fn prepare_data(
         let Some(light_index) = light_index.0 else {
             continue;
         };
-        for (view, bin) in bins.0.iter_mut().filter(|(_, bin)| bin.visible) {
+        for (view, bin) in bins.views.iter().filter(|(_, bin)| bin.visible) {
             let slot = view_bins
                 .entry(*view)
                 .or_default()
@@ -587,6 +509,246 @@ pub(crate) fn prepare_data(
             )),
         );
         light_bind_groups.values.insert(view, bind_group);
+    }
+}
+
+/// What each occluder's part of the bins depended on last frame.
+#[derive(Resource, Default)]
+pub(crate) struct OccluderHistory(HashMap<Entity, OccluderSnapshot>);
+
+struct OccluderSnapshot {
+    pos: Vec2,
+    rot: f32,
+    aabb: Aabb2d,
+    shape: Occluder2dShape,
+    layers: RenderLayers,
+    indices: [Option<(usize, u32)>; 3],
+    frame: u32,
+}
+
+fn buffer_index(index: Option<BufferIndex>) -> Option<(usize, u32)> {
+    index.map(|i| (i.index, i.generation))
+}
+
+impl OccluderHistory {
+    /// Records this frame's occluders and returns where they changed since last frame:
+    /// the old and new bounds of each occluder that moved or changed, was added or was removed.
+    fn update(
+        &mut self,
+        occluders: &[(
+            Entity,
+            &ExtractedOccluder,
+            &RoundOccluderIndex,
+            &PolyOccluderIndex,
+        )],
+        frame: u32,
+    ) -> OccluderChanges {
+        let mut changed = vec![];
+        for (entity, occluder, round_index, poly_index) in occluders {
+            let indices = [
+                buffer_index(round_index.0),
+                buffer_index(poly_index.occluder),
+                buffer_index(poly_index.vertices),
+            ];
+            if let Some(old) = self.0.get_mut(entity) {
+                if old.pos == occluder.pos
+                    && old.rot == occluder.rot
+                    && old.aabb == occluder.aabb
+                    && old.indices == indices
+                    && old.layers == occluder.render_layers
+                    && old.shape == occluder.shape
+                {
+                    old.frame = frame;
+                    continue;
+                }
+                changed.push(old.aabb);
+            }
+            changed.push(occluder.aabb);
+            self.0.insert(
+                *entity,
+                OccluderSnapshot {
+                    pos: occluder.pos,
+                    rot: occluder.rot,
+                    aabb: occluder.aabb,
+                    shape: occluder.shape.clone(),
+                    layers: occluder.render_layers.clone(),
+                    indices,
+                    frame,
+                },
+            );
+        }
+        self.0.retain(|_, old| {
+            if old.frame != frame {
+                changed.push(old.aabb);
+            }
+            old.frame == frame
+        });
+        OccluderChanges::new(changed)
+    }
+}
+
+/// The bounds of occluders that changed this frame.
+struct OccluderChanges {
+    aabbs: Vec<Aabb2d>,
+    grid: OccluderGrid,
+}
+
+impl OccluderChanges {
+    fn new(aabbs: Vec<Aabb2d>) -> Self {
+        let grid = OccluderGrid::new(&aabbs);
+        Self { aabbs, grid }
+    }
+
+    /// Whether any change touches `aabb`. `scratch` is reused to avoid allocations.
+    fn intersects(&self, aabb: &Aabb2d, scratch: &mut Vec<u32>) -> bool {
+        if self.aabbs.is_empty() {
+            return false;
+        }
+        self.grid.query(aabb, scratch);
+        scratch
+            .iter()
+            .any(|&i| self.aabbs[i as usize].intersects(aabb))
+    }
+}
+
+/// Sorts the occluders near `light` into its bins in each of `views`.
+fn fill_bins(
+    light: &ExtractedPointLight,
+    views: &[(RetainedViewEntity, &RenderLayers, bool, Aabb2d)],
+    bins: &mut BinBuffers,
+    occluders: &[(
+        Entity,
+        &ExtractedOccluder,
+        &RoundOccluderIndex,
+        &PolyOccluderIndex,
+    )],
+    grid: &OccluderGrid,
+    nearby: &mut Vec<u32>,
+) {
+    // Each visible view's bins, and whether the current occluder reaches the light there.
+    let mut view_bins: Vec<_> = bins
+        .views
+        .iter_mut()
+        .filter_map(|(view, bin)| {
+            let (_, layers, soft_shadows, aabb) = views.iter().find(|v| v.0 == *view)?;
+            Some((bin, *layers, *soft_shadows, *aabb, false))
+        })
+        .collect();
+
+    let bounds = views
+        .iter()
+        .skip(1)
+        .fold(views[0].3, |bounds, view| bounds.merge(&view.3));
+    grid.query(&bounds, nearby);
+
+    for &i in nearby.iter() {
+        let (_, occluder, round_index, poly_index) = occluders[i as usize];
+        if !light.render_layers.intersects(&occluder.render_layers) {
+            continue;
+        }
+
+        let mut any_soft_shadows = false;
+        let mut any_view = false;
+        for (_, layers, soft_shadows, aabb, hit) in &mut view_bins {
+            *hit = occluder.aabb.intersects(aabb) && layers.intersects(&occluder.render_layers);
+            any_soft_shadows |= *hit && *soft_shadows;
+            any_view |= *hit;
+        }
+        if !any_view {
+            continue;
+        }
+
+        let mut add = |data: &OccluderData| {
+            for (bin, .., hit) in &mut view_bins {
+                if *hit {
+                    bin.add_occluder(data);
+                }
+            }
+        };
+
+        if let Occluder2dShape::RoundRectangle {
+            half_width,
+            half_height,
+            radius,
+        } = occluder.shape
+        {
+            let Some(occluder_index) = round_index.0 else {
+                continue;
+            };
+
+            let vertices = vec![
+                vec2(-half_width - radius, -half_height - radius),
+                vec2(-half_width - radius, half_height + radius),
+                vec2(half_width + radius, half_height + radius),
+                vec2(half_width + radius, -half_height - radius),
+            ];
+
+            let light_pos = Vec2::from_angle(-occluder.rot).rotate(light.pos - occluder.pos);
+
+            let aabb = Aabb2d {
+                min: vec2(-half_width - radius, -half_height - radius),
+                max: vec2(half_width + radius, half_height + radius),
+            };
+
+            let isometry = Isometry2d {
+                translation: occluder.pos,
+                rotation: Rot2::radians(occluder.rot),
+            };
+
+            let vertices = translate_vertices(vertices, isometry.translation, isometry.rotation);
+
+            let closest = aabb.closest_point(light_pos);
+            let light_inside_occluder = closest == light_pos;
+
+            push_vertices(
+                &mut add,
+                &vertices,
+                light.pos,
+                light.core.radius,
+                0,
+                occluder_index.index as u32,
+                closest.distance(light_pos),
+                // 0.0,
+                light_inside_occluder,
+                false,
+                any_soft_shadows,
+                true,
+            );
+        } else {
+            let Some(occluder_index) = poly_index.occluder else {
+                continue;
+            };
+
+            let Some(vertex_index) = poly_index.vertices else {
+                continue;
+            };
+
+            let vertices = occluder.vertices();
+
+            let light_inside_occluder = matches!(occluder.shape, Occluder2dShape::Polygon { .. })
+                && point_inside_poly(
+                    light.pos,
+                    &vertices,
+                    occluder.aabb,
+                    occluder.shape.is_concave(),
+                );
+
+            let closest = occluder.aabb.closest_point(light.pos);
+
+            push_vertices(
+                &mut add,
+                &vertices,
+                light.pos,
+                light.core.radius,
+                vertex_index.index as u32,
+                occluder_index.index as u32,
+                closest.distance(light.pos),
+                light_inside_occluder,
+                true,
+                any_soft_shadows,
+                occluder.shape.is_concave(),
+            );
+        }
     }
 }
 
