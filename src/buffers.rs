@@ -435,15 +435,6 @@ impl<T: ShaderType + WriteInto + Default + NoUninit> BufferManager<T> {
                     .expect("couldn't write to buffer");
             }
         }
-
-        // info!(
-        //     "Finished writing! Buffer length: {}, Element size: {}, Buffer size: {}, Buffer capacity: {}, Unoccupied: {}",
-        //     self.buffer.len(),
-        //     T::min_size().get(),
-        //     self.buffer.buffer().unwrap().size(),
-        //     self.buffer.capacity(),
-        //     self.free_indices.len(),
-        // );
     }
 
     /// Flush the changes at the end of a render frame. This writes all changes to the GPU.
@@ -478,7 +469,7 @@ impl<T: ShaderType + WriteInto + Default + NoUninit> BufferManager<T> {
     }
 }
 
-/// The amount of bins that each [`Bins`] will have.
+/// The number of angular bins around each light.
 pub const N_BINS: usize = 256;
 pub const N_BINS_FLOAT: f32 = 256.0;
 
@@ -496,7 +487,6 @@ pub struct BinBuffers {
 #[derive(PartialEq)]
 pub struct BinKey {
     pub pos: Vec2,
-    pub radius: f32,
     pub core_radius: f32,
     pub cast_shadows: bool,
     pub layers: RenderLayers,
@@ -505,9 +495,8 @@ pub struct BinKey {
     pub views: Vec<(RetainedViewEntity, Aabb2d, RenderLayers, bool)>,
 }
 
-/// Occluders near a light, sorted into [`N_BINS`] angular bins around it.
-/// This is the most important acceleration structure used by Firefly. It is used in a custom
-/// type of angular sweep with BVH-inspired elements.
+/// Occluders near a light, sorted into [`N_BINS`] angular bins around it, closest first.
+/// A pixel only tests the occluders in its bin.
 pub struct BinBuffer {
     /// Whether the light was visible in this view this frame.
     pub visible: bool,
@@ -531,14 +520,7 @@ impl Default for BinBuffer {
 }
 
 impl BinBuffer {
-    /// Empty the bins.
-    pub fn reset(&mut self) {
-        for bin in self.occluders.iter_mut() {
-            bin.clear();
-        }
-    }
-
-    /// Sort the added occluders into `sorted`.
+    /// Move the added occluders into `sorted`, emptying the heaps.
     pub fn finish(&mut self) {
         self.sorted.clear();
         for (bin, start) in self.occluders.iter_mut().zip(&mut self.starts) {
@@ -550,7 +532,7 @@ impl BinBuffer {
         self.starts[N_BINS] = self.sorted.len() as u32;
     }
 
-    /// Add an occluder to this buffer. Or a set of edges, in case of a polygonal occluder.
+    /// Add an occluder, or a chain of a polygon's edges, to the bins it spans.
     pub fn add_occluder(&mut self, data: &OccluderData) {
         if data.angle.ceil() >= TAU {
             self.add_to_bins(0, N_BINS - 1, data.pointer);
@@ -581,15 +563,16 @@ impl BinBuffer {
     }
 }
 
-/// The size of one light's block in [`ViewBins::bins`]: its light index, then the start of
-/// each bin, then the end of the last bin.
+/// The size of one light's block in [`ViewBinBuffers`]'s bin buffer: its light index, then
+/// where each bin starts in the occluder buffer, then where the last one ends.
 pub const BIN_BLOCK_SIZE: usize = N_BINS + 2;
 
 /// The bins of every light visible in a view, in two GPU buffers, so a view needs one bind group.
 pub struct ViewBinBuffers {
-    /// Every light's bins, one after another. Index 0 is unused.
+    /// Every light's bins, one after another. Starts with a dummy, so it's never empty
+    /// and can always be bound.
     occluders: RawBufferVec<OccluderPointer>,
-    /// One block of [`BIN_BLOCK_SIZE`] per light. See [`BIN_BLOCK_SIZE`].
+    /// One block of [`BIN_BLOCK_SIZE`] per light.
     bins: RawBufferVec<u32>,
     /// The light pass's bind group for this view. `None` when the view has no lights.
     pub bind_group: Option<BindGroup>,
@@ -621,15 +604,13 @@ impl ViewBinBuffers {
         self.bins.len() / BIN_BLOCK_SIZE
     }
 
-    /// Append a light's finished bins. Returns the light's slot.
-    pub fn push(&mut self, light_index: u32, bins: &BinBuffer) -> u32 {
-        let slot = self.n_lights() as u32;
+    /// Append a light's finished bins. The light's slot is the number of lights before it.
+    pub fn push(&mut self, light_index: u32, bins: &BinBuffer) {
         let offset = self.occluders.len() as u32;
         let indices = self.bins.values_mut();
         indices.push(light_index);
         indices.extend(bins.starts.iter().map(|start| offset + start));
         self.occluders.values_mut().extend_from_slice(&bins.sorted);
-        slot
     }
 
     pub fn write(&mut self, device: &RenderDevice, queue: &RenderQueue) {
@@ -799,10 +780,6 @@ impl VertexBuffer {
                 .write_buffer_range(queue, index..last_index)
                 .expect("couldn't write range");
 
-            // for vertex in self.vertices.values() {
-            //     info!("{vertex}");
-            // }
-
             return BufferIndex {
                 index,
                 generation: self.current_generation,
@@ -815,11 +792,6 @@ impl VertexBuffer {
             self.next_index += 1;
         }
 
-        // if self.next_index % 2 == 1 {
-        //     self.vertices.push(default());
-        //     self.next_index += 1;
-        // }
-
         if self.next_index >= self.vertices.capacity() {
             self.vertices.reserve(
                 (self.next_index as f32 / 4096.0).ceil() as usize * 4096,
@@ -831,13 +803,6 @@ impl VertexBuffer {
                 .write_buffer_range(queue, index..self.next_index)
                 .expect("couldn't write range");
         }
-
-        // info!(
-        //     "Vertex buffer capacity: {}, length: {}, empty slots: {}",
-        //     self.vertices.capacity(),
-        //     self.vertices.len(),
-        //     self.empty_slots
-        // );
 
         BufferIndex {
             index,

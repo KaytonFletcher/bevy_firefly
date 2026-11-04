@@ -192,15 +192,9 @@ fn prepare_config(
 
             light_bands: config.light_bands.unwrap_or(0.0),
 
-            soft_shadows: match config.soft_shadows {
-                true => 1,
-                false => 0,
-            },
+            soft_shadows: config.soft_shadows as u32,
 
-            z_sorting: match config.z_sorting {
-                false => 0,
-                true => 1,
-            },
+            z_sorting: config.z_sorting as u32,
 
             z_sorting_error_margin: config.z_sorting_error_margin,
 
@@ -343,7 +337,7 @@ fn prepare_lightmap(
 pub(crate) fn prepare_data(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
-    mut light_query: Query<(Entity, &ExtractedPointLight, &LightIndex, &mut BinBuffers)>,
+    mut light_query: Query<(&ExtractedPointLight, &LightIndex, &mut BinBuffers)>,
     occluders: Query<(
         Entity,
         &ExtractedOccluder,
@@ -383,7 +377,7 @@ pub(crate) fn prepare_data(
 
     lights.par_splat_map_mut(ComputeTaskPool::get(), None, |_, lights| {
         let mut nearby = vec![];
-        for (_, light, light_index, bins) in lights {
+        for (light, light_index, bins) in lights {
             for bin in bins.views.values_mut() {
                 bin.visible = false;
             }
@@ -439,7 +433,6 @@ pub(crate) fn prepare_data(
             // nor any occluder near it changed since.
             let key = BinKey {
                 pos: light.pos,
-                radius: light.radius,
                 core_radius: light.core.radius,
                 cast_shadows: light.cast_shadows,
                 layers: light.render_layers.clone(),
@@ -459,9 +452,6 @@ pub(crate) fn prepare_data(
             }
             bins.key = Some(key);
 
-            for (view, ..) in &views {
-                bins.views.get_mut(view).unwrap().reset();
-            }
             if light.cast_shadows && !views.is_empty() {
                 fill_bins(light, &views, bins, &occluders, &occluder_grid, &mut nearby);
             }
@@ -473,8 +463,8 @@ pub(crate) fn prepare_data(
 
     drop(lights);
 
-    // Concatenate the bins of each view's visible lights into one buffer per view, so a view
-    // needs one bind group and one draw. A light's slot is the instance index it's drawn with.
+    // Concatenate each view's visible lights' bins, so a view needs one bind group and one
+    // draw. A light's slot is its instance index.
     view_bins.retain(|view, _| cameras.iter().any(|c| c.0.retained_view_entity == *view));
     for camera in &cameras {
         let bins = view_bins.entry(camera.0.retained_view_entity).or_default();
@@ -483,7 +473,7 @@ pub(crate) fn prepare_data(
             continue;
         };
         for (entity, _) in visible.iter_visible() {
-            let Ok((_, _, light_index, light_bins)) = light_query.get(*entity) else {
+            let Ok((_, light_index, light_bins)) = light_query.get(*entity) else {
                 continue;
             };
             let (Some(light_index), Some(bin)) = (
@@ -730,7 +720,6 @@ fn fill_bins(
                 0,
                 occluder_index.index as u32,
                 closest.distance(light_pos),
-                // 0.0,
                 light_inside_occluder,
                 false,
                 any_soft_shadows,
@@ -835,8 +824,6 @@ fn push_vertices(
         });
         return;
     }
-    // info!("pushing vertices: {occluder_vertices:?}");
-    // info!("start vertex: {start_vertex}");
 
     let vertices = occluder_vertices.iter().enumerate().map(|(i, v)| Vertex {
         index: i as u32,
@@ -873,21 +860,12 @@ fn push_vertices(
         }
     }
 
-    // info!("");
-    // info!("---------");
     let mut push_slice = |slice: &OccluderSlice, vertices: &[Vertex]| {
         if slice.length > 1 {
             let rev: u32 = match rev {
                 true => 1,
                 false => 0,
             };
-
-            // info!("pushing {slice:?}! poly: {poly}");
-
-            // info!(
-            //     "slice start: {}, slice length: {}",
-            //     slice.start_vertex, slice.length
-            // );
 
             let min_v = (rev << 29) | (slice.start_vertex + start_vertex);
             let length = slice.length;
@@ -985,17 +963,17 @@ fn push_vertices(
             if let Some(last) = last {
                 let loops = (vertex.angle - last.angle).abs() > PI;
 
-                // if the next vertex is decreasing
+                // The next vertex is decreasing.
                 if (!loops && vertex.angle <= last.angle) || (loops && vertex.angle >= last.angle) {
                     push_slice(&slice, &vertices);
                     slice = OccluderSlice::new(index, vertex);
                 }
-                // if the next vertex is increasing, simple case
+                // The next vertex is increasing.
                 else if !loops && vertex.angle > last.angle {
                     slice.length += 1;
                     slice.angle += vertex.angle - last.angle;
                 }
-                // if the next vertex is increasing and loops over
+                // The next vertex is increasing and crosses the atan2 seam.
                 else {
                     if poly {
                         slice.split = Some(slice.length);

@@ -39,8 +39,7 @@ var<storage> vertices: array<vec2f>;
 @group(1) @binding(5)
 var<storage> occluders: array<OccluderPointer>;
 
-// One block of BIN_BLOCK_SIZE per light: its index in `lights`, then where each of
-// its bins starts in `occluders`, then where the last one ends.
+// One block of BIN_BLOCK_SIZE per light. See BIN_BLOCK_SIZE in buffers.rs.
 @group(1) @binding(6)
 var<storage> bins: array<u32>;
 
@@ -118,7 +117,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4f {
         return vec4f(0);
     }
 
-    // Zeros where a read isn't needed behave the same as the real values.
+    // Skipped reads give zeros, which act like the real values when unused.
     let uv = position.xy / config.lightmap_size;
     var normal = vec4f(0);
     if config.normal_mode != 0 {
@@ -135,7 +134,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4f {
     var angle_multi = 1.0;
 
     if angle > light.inner_angle / 2. {
-        // return vec4<f32>(1.0, 0.0, 0.0, 1.0);
         angle_multi = 1.0 - (angle - light.inner_angle / 2.) / (light.outer_angle / 2. - light.inner_angle / 2.);
     }
 
@@ -180,10 +178,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4f {
         return res;
     }
 
-    var round_index = 0u;
-    var start_vertex = 0u;
-    var sequence_index = 0u;
-
     var shadow = vec3f(1); 
 
     var bin = u32(floor(((atan2(pos.y - light.pos.y, pos.x - light.pos.x) + PI) / PI2) * f32(N_BINS)));
@@ -192,23 +186,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4f {
     let left = bins[bin_block + 1 + bin];
     let right = bins[bin_block + 2 + bin];
 
-    // if left >= right {
-        // return vec4f(1.0, 0.0, 0.0, 1.0);
-    // }
-
     var prev_index = 0u; 
     var accumulated_occlusion = 0.0;
-
-    // if left >= right {
-    //     return vec4<f32>(1.0, 0.0, 0.0, 1.0);
-    // }
 
     for (var pointer_index = left; pointer_index < right; pointer_index += 1) {
         let pointer = occluders[pointer_index];
         
         if pointer.distance > dist { break; }
         
-        // return vec4<f32>(1.0, 0.0, 0.0, 1.0);
         let occluder_type = pointer.index & 2147483648u;
         let occluder_index = pointer.index & 2147483647u;
 
@@ -221,7 +206,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4f {
             }
 
             let result = round_check(pos, occluder_index); 
-
 
             if result > 0.0 {
                 shadow = shadow_blend(shadow, round_occluders[occluder_index].color.rgb, round_occluders[occluder_index].opacity * result);
@@ -280,7 +264,6 @@ fn poly_check(pos: vec2f, index: u32, term: u32, rev: u32, min_v: u32, split: u3
     var len = length; 
 
     if rev == 0 {
-
         if term == 1 {
             len = split + 1;
         }
@@ -345,18 +328,11 @@ fn poly_check(pos: vec2f, index: u32, term: u32, rev: u32, min_v: u32, split: u3
 }
 
 fn get_softness_multi(light_range: f32, light_pos: vec2<f32>, pos: vec2<f32>, extreme_left: vec2<f32>, extreme_right: vec2<f32>) -> f32 {
-    // if distance(pos, extreme_right) < 30.0 {
-    //     return 1.0;
-    // }
-
-    // let left_range = light_range;
-    
     let left_range = min(light_range, distance(extreme_left, light_pos)); 
  
     var left_t1 = light_pos + rotate_90(normalize(extreme_left - light_pos)) * left_range;
     var left_t2 = light_pos;
 
-    // let right_range = light_range;
     let right_range = min(light_range, distance(extreme_right, light_pos));
 
     var right_t1 = light_pos;
@@ -428,7 +404,6 @@ fn vertex_reverse(start: u32, index: i32, start_vertex: u32, n_vertices: u32) ->
 } 
 
 fn bs_vertex_forward(angle: f32, start: u32, length: u32, term: u32, start_vertex: u32, n_vertices: u32) -> i32 {
-
     var ans = -1;
     
     var low = 0i; 
@@ -459,7 +434,6 @@ fn bs_vertex_forward(angle: f32, start: u32, length: u32, term: u32, start_verte
 }
 
 fn bs_vertex_reverse(angle: f32, start: u32, length: u32, term: u32, start_vertex: u32, n_vertices: u32) -> i32 {
-
     var ans = -1;
     
     var low = 0i; 
@@ -491,7 +465,6 @@ fn bs_vertex_reverse(angle: f32, start: u32, length: u32, term: u32, start_verte
 
 // checks if pixel is blocked by round occluder
 fn round_check(pos: vec2f, occluder: u32) -> f32 {
-
     let occ = round_occluders[occluder];
     let half_w = occ.half_width;
     let half_h = occ.half_height;
@@ -503,9 +476,6 @@ fn round_check(pos: vec2f, occluder: u32) -> f32 {
     let c = cos(occ.rot);
     let s = sin(occ.rot);
 
-    // let c = 1.0; 
-    // let s = 0.0;
-
     let p_local = vec2f(relative_pos.x * c + relative_pos.y * s, -relative_pos.x * s + relative_pos.y * c);
     let l_local = vec2f(relative_light.x * c + relative_light.y * s, -relative_light.x * s + relative_light.y * c);
     
@@ -514,7 +484,6 @@ fn round_check(pos: vec2f, occluder: u32) -> f32 {
     let rect = vec4f(-(half_w + radius), -(half_h + radius), half_w + radius, half_h + radius);
 
     if !rect_line_intersection(p_local, l_local, rect) {
-
         if config.soft_shadows > 0 && light.core_radius > 0.0 {
             return get_round_extreme_angle(half_w, half_h, p_local, l_local, light.core_radius, radius);
         }
