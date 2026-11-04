@@ -10,7 +10,7 @@ use crate::{
         CombinationMode, ExtractedCombineLightmapTo, ExtractedCombinedLightmaps,
         ExtractedWorldData, LightmapSize, NormalMode,
     },
-    lights::{LightBatch, LightBatches, LightBindGroups, LightIndex, LightLut, LightPointer},
+    lights::{LightBatch, LightBatches, LightBindGroups, LightIndex, LightLut},
     occluders::{PolyOccluderIndex, RoundOccluderIndex, point_inside_poly, translate_vertices},
     phases::SpritePhase,
     pipelines::{
@@ -332,13 +332,7 @@ fn prepare_lightmap(
 pub(crate) fn prepare_data(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
-    mut lights: Query<(
-        Entity,
-        &ExtractedPointLight,
-        &mut LightPointer,
-        &LightIndex,
-        &mut BinBuffers,
-    )>,
+    mut lights: Query<(Entity, &ExtractedPointLight, &LightIndex, &mut BinBuffers)>,
     occluders: Query<(&ExtractedOccluder, &RoundOccluderIndex, &PolyOccluderIndex)>,
     cameras: Query<(
         &ExtractedView,
@@ -370,17 +364,10 @@ pub(crate) fn prepare_data(
         .par_splat_map_mut(ComputeTaskPool::get(), None, |_, lights| {
             let mut bind_groups: Vec<(Entity, HashMap<RetainedViewEntity, BindGroup>)> = vec![];
 
-            for (entity, light, light_pointer, light_index, bins) in lights {
-                let Some(index) = light_index.0 else {
+            for (entity, light, light_index, bins) in lights {
+                if light_index.0.is_none() {
                     continue;
-                };
-
-                light_pointer.0.set(index.index as u32);
-                light_pointer.0.write_buffer(&render_device, &render_queue);
-
-                let Some(light_pointer_binding) = light_pointer.0.binding() else {
-                    continue;
-                };
+                }
 
                 let cameras = cameras
                     .iter()
@@ -552,7 +539,6 @@ pub(crate) fn prepare_data(
                             &BindGroupEntries::sequential((
                                 &lightmap_pipeline.sampler,
                                 light_buffer.binding(),
-                                light_pointer_binding.clone(),
                                 round_occluders.binding(),
                                 poly_occluders.binding(),
                                 vertices.binding(),

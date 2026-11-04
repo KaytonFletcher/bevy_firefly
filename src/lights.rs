@@ -24,9 +24,7 @@ use bevy::{
             RenderCommand, RenderCommandResult, SetItemPipeline, TrackedRenderPass,
             ViewBinnedRenderPhases,
         },
-        render_resource::{
-            BindGroup, PipelineCache, ShaderType, SpecializedRenderPipelines, StorageBuffer,
-        },
+        render_resource::{BindGroup, PipelineCache, ShaderType, SpecializedRenderPipelines},
         sync_world::SyncToRenderWorld,
         view::{
             ExtractedView, RenderVisibleEntities, ResolvedCompositingSpace, RetainedViewEntity,
@@ -267,7 +265,7 @@ impl LightCore {
 
 /// The data that is extracted to the render world from a [`PointLight2d`].
 #[derive(Component, Clone)]
-#[require(BinBuffers, LightIndex, LightPointer)]
+#[require(BinBuffers, LightIndex)]
 pub struct ExtractedPointLight {
     pub pos: Vec2,
     pub color: Color,
@@ -316,10 +314,6 @@ pub struct UniformPointLight {
     pub z: f32,
     pub height: f32,
 }
-
-/// Render World component that contains the buffer a [`PointLight2d`] writes to each frame.   
-#[derive(Component, Default)]
-pub struct LightPointer(pub StorageBuffer<u32>);
 
 /// Plugin responsible for functionality related to lights. Added automatically
 /// by [`FireflyPlugin`](crate::prelude::FireflyPlugin).
@@ -500,20 +494,25 @@ impl<P: PhaseItem> RenderCommand<P> for SetLightTextureBindGroup {
     }
 }
 
+/// Draws the light's quad. The instance index is the light's slot in the light buffer.
 pub(crate) struct DrawLightBatch;
 impl<P: PhaseItem> RenderCommand<P> for DrawLightBatch {
     type Param = ();
-    type ViewQuery = Read<ExtractedView>;
-    type ItemQuery = ();
+    type ViewQuery = ();
+    type ItemQuery = Read<LightIndex>;
 
     fn render<'w>(
         _: &P,
         _: ROQueryItem<'w, '_, Self::ViewQuery>,
-        _entity: Option<()>,
+        light_index: Option<&'w LightIndex>,
         _: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
-        pass.draw(0..6, 0..1);
+        let Some(BufferIndex { index, .. }) = light_index.and_then(|i| i.0) else {
+            return RenderCommandResult::Skip;
+        };
+        let index = index as u32;
+        pass.draw(0..6, index..index + 1);
         RenderCommandResult::Success
     }
 }
