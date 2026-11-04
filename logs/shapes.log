@@ -1,0 +1,73 @@
+warning: unused import: `prelude::*`
+ --> src/app.rs:8:5
+  |
+8 |     prelude::*,
+  |     ^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `change_detection::Tick`
+ --> src/lights.rs:9:9
+  |
+9 |         change_detection::Tick,
+  |         ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `TextureFormat` and `query::QueryItem`
+  --> src/nodes.rs:4:11
+   |
+ 4 |     ecs::{query::QueryItem, system::lifetimeless::Read},
+   |           ^^^^^^^^^^^^^^^^
+...
+10 |             TextureAspect, TextureFormat, TextureUsages, TextureViewDescriptor,
+   |                            ^^^^^^^^^^^^^
+
+warning: unused import: `ViewTarget`
+  --> src/pipelines.rs:25:44
+   |
+25 |             COLOR_TARGET_FORMAT_MASK_BITS, ViewTarget, ViewUniform, texture_format_from_code,
+   |                                            ^^^^^^^^^^
+
+warning: use of deprecated module `std::usize`: all constants in this module replaced by associated constants on the type
+ --> src/data.rs:1:10
+  |
+1 | use std::usize;
+  |          ^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated associated function `bevy::bevy_asset::AssetId::<A>::invalid`: Use `Option<AssetId>` if possible. `AssetId::default` may also work, but note that the default can map to a valid asset.
+   --> src/prepare.rs:946:47
+    |
+946 |         let mut batch_image_handle = AssetId::invalid();
+    |                                               ^^^^^^^
+
+warning: use of deprecated associated function `bevy::bevy_asset::AssetId::<A>::invalid`: Use `Option<AssetId>` if possible. `AssetId::default` may also work, but note that the default can map to a valid asset.
+   --> src/prepare.rs:964:47
+    |
+964 |                 batch_image_handle = AssetId::invalid();
+    |                                               ^^^^^^^
+
+warning: `bevy_firefly` (lib) generated 7 warnings (run `cargo fix --lib -p bevy_firefly` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running `target/debug/examples/shapes`
+2026-11-04T17:53:27.308086Z  INFO bevy_diagnostic::system_information_diagnostics_plugin::internal: SystemInfo { os: "Linux (Ubuntu 26.04)", kernel: "7.0.0-1017-azure", cpu: "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz", core_count: "2", memory: "15.6 GiB" }
+2026-11-04T17:53:27.336676Z  WARN winit::platform_impl::linux::x11::xdisplay: error setting XSETTINGS; Xft options won't reload automatically
+2026-11-04T17:53:27.386241Z  INFO bevy_render::renderer: AdapterInfo { name: "llvmpipe (LLVM 21.1.8, 256 bits)", vendor: 65541, device: 0, device_type: Cpu, device_pci_bus_id: "", driver: "llvmpipe", driver_info: "Mesa 26.0.8-1ubuntu0.3 (LLVM 21.1.8)", backend: Vulkan, subgroup_min_size: 8, subgroup_max_size: 8, transient_saves_memory: Some(false), limit_bucket: None }
+2026-11-04T17:53:27.386328Z  WARN bevy_render::renderer: The selected adapter is using a driver that only supports software rendering. This is likely to be very slow. See https://bevy.org/learn/errors/b0006/
+ALSA lib confmisc.c:855:(parse_card) [error.core] cannot find card '0'
+ALSA lib conf.c:5211:(_snd_config_evaluate) [error.core] function snd_func_card_inum returned error: No such file or directory
+ALSA lib confmisc.c:422:(snd_func_concat) [error.core] error evaluating strings
+ALSA lib conf.c:5211:(_snd_config_evaluate) [error.core] function snd_func_concat returned error: No such file or directory
+ALSA lib confmisc.c:1342:(snd_func_refer) [error.core] error evaluating name
+ALSA lib conf.c:5211:(_snd_config_evaluate) [error.core] function snd_func_refer returned error: No such file or directory
+ALSA lib conf.c:5734:(snd_config_expand) [error.core] Evaluate error: No such file or directory
+ALSA lib pcm.c:2722:(snd_pcm_open_noupdate) [error.pcm] Unknown PCM default
+2026-11-04T17:53:27.626638Z  WARN bevy_audio::audio_output: No audio device found.
+2026-11-04T17:53:27.667329Z  INFO bevy_pbr::cluster: GPU clustering is supported on this device.
+2026-11-04T17:53:27.667652Z  INFO bevy_render::batching::gpu_preprocessing: GPU preprocessing is fully supported on this device.
+2026-11-04T17:53:27.674345Z  INFO bevy_winit::system: Creating new window shapes (67v0)
+2026-11-04T17:53:27.674660Z  WARN winit::platform_impl::linux::x11::util::randr: XRandR reported that the display's 0mm in size, which is certifiably insane
+2026-11-04T17:53:27.674778Z  INFO winit::platform_impl::linux::x11::window: Guessed window scale factor: 1
+2026-11-04T17:53:40.260089Z  INFO bevy_dev_tools::ci_testing::systems: Took a screenshot at frame 100.
+2026-11-04T17:53:41.121759Z  INFO bevy_render::view::window::screenshot: Screenshot saved to ./screenshot-100.png
+2026-11-04T17:53:41.121798Z  INFO bevy_dev_tools::ci_testing::systems: Exiting. Test successful!
