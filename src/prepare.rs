@@ -7,7 +7,8 @@ use crate::{
     CombinedLightMapTextures, LightmapPhase, NormalMapTexture, SpriteStencilTexture,
     buffers::{BinBuffer, BinBuffers, BufferManager, OccluderData, OccluderPointer, VertexBuffer},
     data::{
-        CombinationMode, ExtractedCombinedLightmaps, ExtractedWorldData, LightmapSize, NormalMode,
+        CombinationMode, ExtractedCombineLightmapTo, ExtractedCombinedLightmaps,
+        ExtractedWorldData, LightmapSize, NormalMode,
     },
     lights::{LightBatch, LightBatches, LightBindGroups, LightIndex, LightLut, LightPointer},
     occluders::{PolyOccluderIndex, RoundOccluderIndex, point_inside_poly, translate_vertices},
@@ -78,8 +79,13 @@ impl Plugin for PreparePlugin {
         );
 
         render_app.add_systems(Render, prepare_data.in_set(RenderSystems::Prepare));
-        render_app.add_systems(Render, prepare_config.in_set(RenderSystems::Prepare));
-        render_app.add_systems(Render, prepare_lightmap.in_set(RenderSystems::Prepare));
+        // `prepare_data` reads the config and textures these insert, for the same frame.
+        render_app.add_systems(
+            Render,
+            (prepare_config, prepare_lightmap)
+                .before(prepare_data)
+                .in_set(RenderSystems::Prepare),
+        );
 
         render_app.add_systems(
             Render,
@@ -127,6 +133,24 @@ fn specialize_light_application_pipeline(
     }
 }
 
+/// Size of the lightmap texture of a camera with this config.
+fn lightmap_extent(config: &FireflyConfig, view_target: &ViewTarget) -> Extent3d {
+    let window_size = view_target.main_texture().size();
+    match config.lightmap_size {
+        LightmapSize::Window => window_size,
+        LightmapSize::Fixed(size) => Extent3d {
+            width: size.x,
+            height: size.y,
+            depth_or_array_layers: 1,
+        },
+        LightmapSize::Scaled(scale) => Extent3d {
+            width: (window_size.width as f32 * scale) as u32,
+            height: (window_size.height as f32 * scale) as u32,
+            depth_or_array_layers: 1,
+        },
+    }
+}
+
 fn prepare_config(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
@@ -135,11 +159,19 @@ fn prepare_config(
         &FireflyConfig,
         &ViewTarget,
         Option<&ExtractedCombinedLightmaps>,
+        Option<&ExtractedCombineLightmapTo>,
     )>,
     mut commands: Commands,
 ) {
-    for (entity, config, view_target, combined_lightmap) in &configs {
+    for (entity, config, view_target, combined_lightmap, combine_to) in &configs {
         let window_size = view_target.main_texture().size();
+
+        // A lightmap combined into another camera's is drawn into that camera's texture array.
+        let target_size = match combine_to.and_then(|to| configs.get(to.0).ok()) {
+            Some((_, config, view_target, ..)) => lightmap_extent(config, view_target),
+            None => lightmap_extent(config, view_target),
+        };
+
         let scale = match config.lightmap_size {
             LightmapSize::Window => vec2(1.0, 1.0),
             LightmapSize::Fixed(size) => vec2(
@@ -190,6 +222,7 @@ fn prepare_config(
             },
 
             texture_scale: scale,
+            lightmap_size: vec2(target_size.width as f32, target_size.height as f32),
         };
         let mut buffer = UniformBuffer::<UniformFireflyConfig>::from(uniform);
         buffer.write_buffer(&render_device, &render_queue);
@@ -214,21 +247,7 @@ fn prepare_lightmap(
 ) {
     for (entity, view_target, view, combined_lightmaps, config, _msaa) in &view_targets {
         let format = view.target_format;
-        let window_size = view_target.main_texture().size();
-
-        let size = match config.lightmap_size {
-            LightmapSize::Window => window_size,
-            LightmapSize::Fixed(size) => Extent3d {
-                width: size.x,
-                height: size.y,
-                depth_or_array_layers: 1,
-            },
-            LightmapSize::Scaled(scale) => Extent3d {
-                width: (window_size.width as f32 * scale) as u32,
-                height: (window_size.height as f32 * scale) as u32,
-                depth_or_array_layers: 1,
-            },
-        };
+        let size = lightmap_extent(config, view_target);
 
         let light_map_texture = texture_cache.get(
             &render_device,

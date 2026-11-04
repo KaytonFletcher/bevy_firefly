@@ -513,7 +513,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawLightBatch {
         _: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
-        pass.draw(0..3, 0..1);
+        pass.draw(0..6, 0..1);
         RenderCommandResult::Success
     }
 }
