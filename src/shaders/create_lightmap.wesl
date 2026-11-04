@@ -1,5 +1,3 @@
-import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput;
-
 @if(TONEMAP_IN_SHADER)
 import bevy_core_pipeline::tonemapping;
 
@@ -9,7 +7,7 @@ import package::shaders::types::{
 };
 
 import package::shaders::utils::{
-    ndc_to_world, frag_coord_to_ndc, orientation, same_orientation, intersect, blend,
+    ndc_to_world, world_to_ndc, frag_coord_to_ndc, ndc_to_uv, uv_to_ndc, orientation, same_orientation, intersect, blend,
     shadow_blend, intersects_arc, rotate, rotate_arctan, between_arctan, distance_point_to_line,
     intersection_point, rect_intersection, rect_line_intersection, intersects_axis_edge, intersects_corner_arc,
     rotate_90, rotate_90_cc, intersects_half, falloff,
@@ -56,170 +54,192 @@ const PI2: f32 = 6.28318530717958647692528676655900577;
 const PI: f32 = 3.14159265358979323846264338327950288;
 const PIDIV2: f32 = 1.57079632679489661923132169163975144; 
 
-@fragment
-fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4f {
-    // return vec4f(0.5);
+// Draws a quad over the light's bounds, so pixels the light can't reach are never shaded.
+@vertex
+fn vertex(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4f {
     let light = lights[light_index];
 
-    var res = vec4f(0);
-    
-    let pos = ndc_to_world(frag_coord_to_ndc(in.position.xy * config.texture_scale));
-    let normal = textureLoad(normal_map, vec2<i32>(in.uv * vec2<f32>(textureDimensions(normal_map))), 0);
-    let stencil = textureSample(sprite_stencil, texture_sampler, in.uv);
+    // Map the corners of the light's world bounds to lightmap pixels,
+    // inverting the mapping `fragment` uses.
+    var lo = vec2f(1e30);
+    var hi = vec2f(-1e30);
+    for (var i = 0u; i < 4u; i += 1u) {
+        let corner = vec2f(f32(i & 1u), f32(i >> 1u)) * 2.0 - 1.0;
+        let ndc = world_to_ndc(light.pos + corner * light.radius);
+        let pixel = (view.viewport.xy + ndc_to_uv(ndc) * view.viewport.zw) / config.texture_scale;
+        lo = min(lo, pixel);
+        hi = max(hi, pixel);
+    }
+    // Pad by a pixel, and clamp so huge or infinite lights still make a sane quad.
+    lo = max(floor(lo) - 1.0, vec2f(-1.0));
+    hi = min(ceil(hi) + 1.0, config.lightmap_size + 1.0);
 
+    // Two triangles: (0, 1, 2) and (2, 1, 3) in corner order.
+    var quad = array(0u, 1u, 2u, 2u, 1u, 3u);
+    let corner = quad[vertex_index];
+    let pixel = select(lo, hi, vec2(corner & 1u, corner >> 1u) == vec2(1u));
+    return vec4f(uv_to_ndc(pixel / config.lightmap_size), 0.0, 1.0);
+}
+
+@fragment
+fn fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
+    let light = lights[light_index];
+
+    let pos = ndc_to_world(frag_coord_to_ndc(position.xy * config.texture_scale));
     let dist = distance(pos, light.pos);
-    
-    let a = pos - light.pos;
-    let b = light.dir;
-    let dot_a_b = clamp(dot(normalize(a), normalize(b)), -1.0, 1.0); 
 
+    let dot_a_b = clamp(dot(normalize(pos - light.pos), normalize(light.dir)), -1.0, 1.0);
     let angle = acos(dot_a_b);
+
+    // Written this way round so a NaN angle (the pixel at the light's center) is unlit.
+    if !(dist < light.radius && angle <= light.outer_angle / 2.) {
+        return vec4f(0);
+    }
+
+    let uv = position.xy / config.lightmap_size;
+    let normal = textureLoad(normal_map, vec2<i32>(uv * vec2<f32>(textureDimensions(normal_map))), 0);
+    let stencil = textureSampleLevel(sprite_stencil, texture_sampler, uv, 0.0);
 
     var light_color = light.color;
 
 @if(TONEMAP_IN_SHADER)
     light_color = tonemapping::tone_mapping(light_color, view.color_grading);
 
-    // light_color = pow(light_color, vec4<f32>(2.2));
+    var res: vec4f;
+    var angle_multi = 1.0;
 
-    if (dist < light.radius && angle <= light.outer_angle / 2.) {
-        
-        var angle_multi = 1.0; 
-
-        if angle > light.inner_angle / 2. {
-            // return vec4<f32>(1.0, 0.0, 0.0, 1.0);
-            angle_multi = 1.0 - (angle - light.inner_angle / 2.) / (light.outer_angle / 2. - light.inner_angle / 2.);
-        }
-
-        var normal_multi = 1.0;
-    
-        if config.normal_mode != 0 && normal.a > 0 && normal.b != 0.1 {
-            let normal_dir = mix(normalize(normal.xyz * 2f - 1f), vec3f(0f), config.normal_attenuation);
-
-            if normal.b == 0.0 {
-                normal_multi = 0.0;
-            }
-            else if normal.b == 0.1 {
-                normal_multi = 1.0;
-            }
-            else if config.normal_mode == 1 {
-                let light_dir = normalize(vec3f(light.pos.x - pos.x, light.pos.y - pos.y, light.z - stencil.g));
-                normal_multi = max(0f, dot(normal_dir, light_dir));
-            }
-            else if config.normal_mode == 2 {
-                let light_dir = normalize(vec3f(light.pos.x - pos.x, light.height - stencil.b, stencil.r - light.pos.y));
-                normal_multi = max(0f, dot(normal_dir, light_dir));
-            }
-            else if config.normal_mode == 3 {
-                let light_dir = normalize(vec3f(light.pos.x - pos.x, light.height - stencil.b, light.z - stencil.g));
-                normal_multi = max(0f, dot(normal_dir, light_dir));
-            }
-        }; 
-
-        if normal.b == NORMAL_DUMMY_B {
-            normal_multi = 1.0;
-        }
-
-        if dist <= light.core_radius {
-            res = vec4f(light_color.xyz, 0) * angle_multi * normal_multi * (light.intensity + light.core_boost * falloff(dist / light.core_radius, light.core_falloff, light.core_falloff_intensity));
-        }
-        else {
-            let x = (dist - light.core_radius) / (light.radius - light.core_radius);
-            res = vec4f(light_color.xyz, 0) * light.intensity * angle_multi * normal_multi * falloff(x, light.falloff, light.falloff_intensity);
-        }
-
-        if dot(res, res) < 0.0001 {
-            return res;
-        }
-
-        var round_index = 0u;
-        var start_vertex = 0u;
-        var sequence_index = 0u;
-
-        var shadow = vec3f(1); 
-
-        var bin = u32(floor(((atan2(pos.y - light.pos.y, pos.x - light.pos.x) + PI) / PI2) * f32(N_BINS)));
-        bin = clamp(bin, 0, N_BINS-1);
-
-        let left = bin_indices.indices[bin]; 
-        let right = bin_indices.indices[bin + 1];
-
-        // if left >= right {
-            // return vec4f(1.0, 0.0, 0.0, 1.0);
-        // }
-
-        var prev_index = 0u; 
-        var accumulated_occlusion = 0.0;
-
-        // if left >= right {
-        //     return vec4<f32>(1.0, 0.0, 0.0, 1.0);
-        // }
-
-        for (var pointer_index = left; pointer_index < right; pointer_index += 1) {
-            let pointer = occluders[pointer_index];
-            
-            if pointer.distance > dist { break; }
-            
-            // return vec4<f32>(1.0, 0.0, 0.0, 1.0);
-            let occluder_type = pointer.index & 2147483648u;
-            let occluder_index = pointer.index & 2147483647u;
-
-            // round occluder
-            if occluder_type == 0 {
-                if stencil.a > 0.1 {
-                    if config.z_sorting == 1 && round_occluders[occluder_index].z_sorting == 1 && stencil.g >= round_occluders[occluder_index].z - config.z_sorting_error_margin {
-                        continue;
-                    }
-                }
-
-                let result = round_check(pos, occluder_index); 
-
-
-                if result > 0.0 {
-                    shadow = shadow_blend(shadow, round_occluders[occluder_index].color.rgb, round_occluders[occluder_index].opacity * result);
-                }            
-            }
-            // poly occluder
-            else {
-                if stencil.a > 0.1 {
-                    if config.z_sorting == 1 && poly_occluders[occluder_index].z_sorting == 1 && stencil.g >= poly_occluders[occluder_index].z - config.z_sorting_error_margin {
-                        continue;
-                    }
-                }
-
-                if prev_index != occluder_index {
-                    if prev_index != 0u && accumulated_occlusion > 0.0 {
-                        shadow = shadow_blend(shadow, poly_occluders[prev_index].color.rgb, poly_occluders[prev_index].opacity * accumulated_occlusion);
-                    }
-                    accumulated_occlusion = 0.0;
-                    prev_index = occluder_index;
-                }
-
-                let term = (pointer.min_v & 3221225472u) >> 30u;
-
-                let rev = (pointer.min_v & 536870912u) >> 29u;
-
-                let min_v = pointer.min_v & 536870911u;
-                let split = pointer.split;
-                let length = pointer.length & 1073741823u;
-
-                let result = poly_check(pos, occluder_index, term, rev, min_v, split, length); 
-                accumulated_occlusion = max(accumulated_occlusion, result);
-            }
-
-            if dot(shadow, shadow) < 0.001 {
-                break;
-            }
-        }
-            
-        if prev_index != 0u && accumulated_occlusion > 0.0 {
-            shadow = shadow_blend(shadow, poly_occluders[prev_index].color.rgb, poly_occluders[prev_index].opacity * accumulated_occlusion);
-        }
-
-        res *= vec4f(shadow, 1);
+    if angle > light.inner_angle / 2. {
+        // return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+        angle_multi = 1.0 - (angle - light.inner_angle / 2.) / (light.outer_angle / 2. - light.inner_angle / 2.);
     }
 
-    // return pow(res, vec4<f32>(1.0/2.2));
+    var normal_multi = 1.0;
+
+    if config.normal_mode != 0 && normal.a > 0 && normal.b != 0.1 {
+        let normal_dir = mix(normalize(normal.xyz * 2f - 1f), vec3f(0f), config.normal_attenuation);
+
+        if normal.b == 0.0 {
+            normal_multi = 0.0;
+        }
+        else if normal.b == 0.1 {
+            normal_multi = 1.0;
+        }
+        else if config.normal_mode == 1 {
+            let light_dir = normalize(vec3f(light.pos.x - pos.x, light.pos.y - pos.y, light.z - stencil.g));
+            normal_multi = max(0f, dot(normal_dir, light_dir));
+        }
+        else if config.normal_mode == 2 {
+            let light_dir = normalize(vec3f(light.pos.x - pos.x, light.height - stencil.b, stencil.r - light.pos.y));
+            normal_multi = max(0f, dot(normal_dir, light_dir));
+        }
+        else if config.normal_mode == 3 {
+            let light_dir = normalize(vec3f(light.pos.x - pos.x, light.height - stencil.b, light.z - stencil.g));
+            normal_multi = max(0f, dot(normal_dir, light_dir));
+        }
+    }; 
+
+    if normal.b == NORMAL_DUMMY_B {
+        normal_multi = 1.0;
+    }
+
+    if dist <= light.core_radius {
+        res = vec4f(light_color.xyz, 0) * angle_multi * normal_multi * (light.intensity + light.core_boost * falloff(dist / light.core_radius, light.core_falloff, light.core_falloff_intensity));
+    }
+    else {
+        let x = (dist - light.core_radius) / (light.radius - light.core_radius);
+        res = vec4f(light_color.xyz, 0) * light.intensity * angle_multi * normal_multi * falloff(x, light.falloff, light.falloff_intensity);
+    }
+
+    if dot(res, res) < 0.0001 {
+        return res;
+    }
+
+    var round_index = 0u;
+    var start_vertex = 0u;
+    var sequence_index = 0u;
+
+    var shadow = vec3f(1); 
+
+    var bin = u32(floor(((atan2(pos.y - light.pos.y, pos.x - light.pos.x) + PI) / PI2) * f32(N_BINS)));
+    bin = clamp(bin, 0, N_BINS-1);
+
+    let left = bin_indices.indices[bin]; 
+    let right = bin_indices.indices[bin + 1];
+
+    // if left >= right {
+        // return vec4f(1.0, 0.0, 0.0, 1.0);
+    // }
+
+    var prev_index = 0u; 
+    var accumulated_occlusion = 0.0;
+
+    // if left >= right {
+    //     return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+    // }
+
+    for (var pointer_index = left; pointer_index < right; pointer_index += 1) {
+        let pointer = occluders[pointer_index];
+        
+        if pointer.distance > dist { break; }
+        
+        // return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+        let occluder_type = pointer.index & 2147483648u;
+        let occluder_index = pointer.index & 2147483647u;
+
+        // round occluder
+        if occluder_type == 0 {
+            if stencil.a > 0.1 {
+                if config.z_sorting == 1 && round_occluders[occluder_index].z_sorting == 1 && stencil.g >= round_occluders[occluder_index].z - config.z_sorting_error_margin {
+                    continue;
+                }
+            }
+
+            let result = round_check(pos, occluder_index); 
+
+
+            if result > 0.0 {
+                shadow = shadow_blend(shadow, round_occluders[occluder_index].color.rgb, round_occluders[occluder_index].opacity * result);
+            }            
+        }
+        // poly occluder
+        else {
+            if stencil.a > 0.1 {
+                if config.z_sorting == 1 && poly_occluders[occluder_index].z_sorting == 1 && stencil.g >= poly_occluders[occluder_index].z - config.z_sorting_error_margin {
+                    continue;
+                }
+            }
+
+            if prev_index != occluder_index {
+                if prev_index != 0u && accumulated_occlusion > 0.0 {
+                    shadow = shadow_blend(shadow, poly_occluders[prev_index].color.rgb, poly_occluders[prev_index].opacity * accumulated_occlusion);
+                }
+                accumulated_occlusion = 0.0;
+                prev_index = occluder_index;
+            }
+
+            let term = (pointer.min_v & 3221225472u) >> 30u;
+
+            let rev = (pointer.min_v & 536870912u) >> 29u;
+
+            let min_v = pointer.min_v & 536870911u;
+            let split = pointer.split;
+            let length = pointer.length & 1073741823u;
+
+            let result = poly_check(pos, occluder_index, term, rev, min_v, split, length); 
+            accumulated_occlusion = max(accumulated_occlusion, result);
+        }
+
+        if dot(shadow, shadow) < 0.001 {
+            break;
+        }
+    }
+        
+    if prev_index != 0u && accumulated_occlusion > 0.0 {
+        shadow = shadow_blend(shadow, poly_occluders[prev_index].color.rgb, poly_occluders[prev_index].opacity * accumulated_occlusion);
+    }
+
+    res *= vec4f(shadow, 1);
+
     return res;
 }
 
