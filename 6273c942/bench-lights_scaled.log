@@ -1,0 +1,20 @@
+[2m2026-11-04T18:03:05.289839Z[0m [32m INFO[0m [1mplugin build[0m[1m{[0mplugin="bevy_diagnostic::DiagnosticsPlugin"[1m}[0m[2m:[0m [2mbevy_diagnostic::system_information_diagnostics_plugin::internal[0m[2m:[0m SystemInfo { os: "Linux (Ubuntu 26.04)", kernel: "7.0.0-1016-aws", cpu: "Intel(R) Xeon(R) 6975P-C", core_count: "2", memory: "15.3 GiB" }
+[2m2026-11-04T18:03:05.292399Z[0m [33m WARN[0m [1mplugin build[0m[1m{[0mplugin="bevy_winit::WinitPlugin"[1m}[0m[2m:[0m [2mwinit::platform_impl::linux::x11::xdisplay[0m[2m:[0m error setting XSETTINGS; Xft options won't reload automatically
+[2m2026-11-04T18:03:05.323855Z[0m [32m INFO[0m [1mplugin build[0m[1m{[0mplugin="bevy_render::RenderPlugin"[1m}[0m[2m:[0m [2mbevy_render::renderer[0m[2m:[0m AdapterInfo { name: "llvmpipe (LLVM 21.1.8, 256 bits)", vendor: 65541, device: 0, device_type: Cpu, device_pci_bus_id: "", driver: "llvmpipe", driver_info: "Mesa 26.0.8-1ubuntu0.3 (LLVM 21.1.8)", backend: Vulkan, subgroup_min_size: 8, subgroup_max_size: 8, transient_saves_memory: Some(false), limit_bucket: None }
+[2m2026-11-04T18:03:05.323876Z[0m [33m WARN[0m [1mplugin build[0m[1m{[0mplugin="bevy_render::RenderPlugin"[1m}[0m[2m:[0m [2mbevy_render::renderer[0m[2m:[0m The selected adapter is using a driver that only supports software rendering. This is likely to be very slow. See https://bevy.org/learn/errors/b0006/
+ALSA lib confmisc.c:855:(parse_card) [error.core] cannot find card '0'
+ALSA lib conf.c:5211:(_snd_config_evaluate) [error.core] function snd_func_card_inum returned error: No such file or directory
+ALSA lib confmisc.c:422:(snd_func_concat) [error.core] error evaluating strings
+ALSA lib conf.c:5211:(_snd_config_evaluate) [error.core] function snd_func_concat returned error: No such file or directory
+ALSA lib confmisc.c:1342:(snd_func_refer) [error.core] error evaluating name
+ALSA lib conf.c:5211:(_snd_config_evaluate) [error.core] function snd_func_refer returned error: No such file or directory
+ALSA lib conf.c:5734:(snd_config_expand) [error.core] Evaluate error: No such file or directory
+ALSA lib pcm.c:2722:(snd_pcm_open_noupdate) [error.pcm] Unknown PCM default
+[2m2026-11-04T18:03:05.361612Z[0m [33m WARN[0m [1mplugin build[0m[1m{[0mplugin="bevy_audio::AudioPlugin"[1m}[0m[2m:[0m [2mbevy_audio::audio_output[0m[2m:[0m No audio device found.
+[2m2026-11-04T18:03:05.366443Z[0m [32m INFO[0m [1mbevy_app[0m[2m:[0m[1mplugin finish[0m[2m:[0m[1mplugin finish[0m[1m{[0mplugin="bevy_pbr::PbrPlugin"[1m}[0m[2m:[0m [2mbevy_pbr::cluster[0m[2m:[0m GPU clustering is supported on this device.
+[2m2026-11-04T18:03:05.366481Z[0m [32m INFO[0m [1mbevy_app[0m[2m:[0m[1mplugin finish[0m[2m:[0m[1mplugin finish[0m[1m{[0mplugin="bevy_pbr::render::mesh::MeshRenderPlugin"[1m}[0m[2m:[0m [2mbevy_render::batching::gpu_preprocessing[0m[2m:[0m GPU preprocessing is fully supported on this device.
+[2m2026-11-04T18:03:05.368030Z[0m [32m INFO[0m [1mbevy_app[0m[2m:[0m [2mbevy_winit::system[0m[2m:[0m Creating new window bench-bin (68v0)
+[2m2026-11-04T18:03:05.368139Z[0m [33m WARN[0m [1mbevy_app[0m[2m:[0m [2mwinit::platform_impl::linux::x11::util::randr[0m[2m:[0m XRandR reported that the display's 0mm in size, which is certifiably insane
+[2m2026-11-04T18:03:05.368169Z[0m [32m INFO[0m [1mbevy_app[0m[2m:[0m [2mwinit::platform_impl::linux::x11::window[0m[2m:[0m Guessed window scale factor: 1
+[2m2026-11-04T18:03:06.541171Z[0m [32m INFO[0m [1msystem[0m[1m{[0mname="bevy_render::view::window::screenshot::save_to_disk<alloc::string::String>::{{closure}}"[1m}[0m[2m:[0m [2mbevy_render::view::window::screenshot[0m[2m:[0m Screenshot saved to /home/runner/work/bevy_firefly/bevy_firefly/bench-results/6273c942/bench-lights_scaled.png
+[2m2026-11-04T18:03:06.673128Z[0m [32m INFO[0m [1msystem[0m[1m{[0mname="bench::record"[1m}[0m[2m:[0m [2mbench[0m[2m:[0m lights_scaled: median frame 72.97 ms
