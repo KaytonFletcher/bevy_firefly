@@ -5,13 +5,12 @@ use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use crate::{
     CombinedLightMapTextures, NormalMapTexture, SpriteStencilTexture,
-    buffers::{
-        BinBuffer, BinBuffers, BufferManager, OccluderData, OccluderPointer, VertexBuffer, ViewBins,
-    },
+    buffers::{BinBuffers, BufferManager, OccluderData, OccluderPointer, VertexBuffer, ViewBins},
     data::{
         CombinationMode, ExtractedCombineLightmapTo, ExtractedCombinedLightmaps,
         ExtractedWorldData, LightmapSize, NormalMode,
     },
+    grid::OccluderGrid,
     lights::{LightBatch, LightBatches, LightBindGroups, LightIndex, LightLut},
     occluders::{PolyOccluderIndex, RoundOccluderIndex, point_inside_poly, translate_vertices},
     phases::SpritePhase,
@@ -30,7 +29,6 @@ use bevy::{
     camera::visibility::RenderLayers,
     core_pipeline::tonemapping::{Tonemapping, TonemappingLuts, get_lut_bindings},
     math::Affine3A,
-    platform::{collections::HashSet, hash::FixedHasher},
     prelude::*,
     render::{
         Render, RenderApp, RenderSystems,
@@ -44,7 +42,7 @@ use bevy::{
         texture::{FallbackImage, GpuImage, TextureCache},
         view::{ExtractedView, ViewTarget, ViewUniforms},
     },
-    shape::{Aabb2d, IntersectsVolume},
+    shape::{Aabb2d, BoundingVolume, IntersectsVolume},
     tasks::{ComputeTaskPool, ParallelSliceMut},
 };
 
@@ -357,7 +355,12 @@ pub(crate) fn prepare_data(
 
     let mut lights: Vec<_> = lights.iter_mut().collect();
 
+    let occluders: Vec<_> = occluders.iter().collect();
+    let aabbs: Vec<_> = occluders.iter().map(|(o, ..)| o.aabb).collect();
+    let occluder_grid = OccluderGrid::new(&aabbs);
+
     lights.par_splat_map_mut(ComputeTaskPool::get(), None, |_, lights| {
+        let mut nearby = vec![];
         for (_, light, light_index, bins) in lights {
             for bin in bins.0.values_mut() {
                 bin.visible = false;
@@ -366,7 +369,8 @@ pub(crate) fn prepare_data(
                 continue;
             }
 
-            let cameras = cameras
+            // The views this light is visible in, and its bounds in each.
+            let views = cameras
                 .iter()
                 .filter_map(|camera| {
                     if !camera.1.intersects(&light.render_layers) {
@@ -391,48 +395,62 @@ pub(crate) fn prepare_data(
                         return None;
                     }
 
-                    let light_aabb = Aabb2d {
+                    let view = camera.0.retained_view_entity;
+                    bins.0.entry(view).or_default().reset();
+
+                    let aabb = Aabb2d {
                         min: light_rect.min,
                         max: light_rect.max,
                     };
-
-                    let bins = bins
-                        .0
-                        .entry(camera.0.retained_view_entity)
-                        .or_insert(default());
-                    bins.reset();
-
-                    Some((camera, light_aabb))
+                    Some((view, camera.1, camera.7.soft_shadows, aabb))
                 })
                 .collect::<Vec<_>>();
 
-            for (occluder, round_index, poly_index) in &occluders {
-                if !light.cast_shadows || !light.render_layers.intersects(&occluder.render_layers) {
+            if views.is_empty() || !light.cast_shadows {
+                continue;
+            }
+
+            // Each visible view's bins, and whether the current occluder reaches the light there.
+            let mut view_bins: Vec<_> = bins
+                .0
+                .iter_mut()
+                .filter_map(|(view, bin)| {
+                    let (_, layers, soft_shadows, aabb) = views.iter().find(|v| v.0 == *view)?;
+                    Some((bin, *layers, *soft_shadows, *aabb, false))
+                })
+                .collect();
+
+            let bounds = views
+                .iter()
+                .skip(1)
+                .fold(views[0].3, |bounds, view| bounds.merge(&view.3));
+            occluder_grid.query(&bounds, &mut nearby);
+
+            for &i in &nearby {
+                let (occluder, round_index, poly_index) = occluders[i as usize];
+                if !light.render_layers.intersects(&occluder.render_layers) {
                     continue;
                 }
 
                 let mut any_soft_shadows = false;
+                let mut any_view = false;
+                for (_, layers, soft_shadows, aabb, hit) in &mut view_bins {
+                    *hit = occluder.aabb.intersects(aabb)
+                        && layers.intersects(&occluder.render_layers);
+                    any_soft_shadows |= *hit && *soft_shadows;
+                    any_view |= *hit;
+                }
+                if !any_view {
+                    continue;
+                }
 
-                let mut retained_views: HashSet<_, FixedHasher> = HashSet::default();
-
-                cameras.iter().for_each(|(camera, light_aabb)| {
-                    if !occluder.aabb.intersects(light_aabb)
-                        || !camera.1.intersects(&occluder.render_layers)
-                    {
-                        return;
+                let mut add = |data: &OccluderData| {
+                    for (bin, .., hit) in &mut view_bins {
+                        if *hit {
+                            bin.add_occluder(data);
+                        }
                     }
-
-                    any_soft_shadows |= camera.7.soft_shadows;
-
-                    retained_views.insert(camera.0.retained_view_entity);
-                });
-
-                let bins = bins
-                    .0
-                    .iter_mut()
-                    .filter(|(retained_view, _bin)| retained_views.contains(*retained_view))
-                    .map(|(_, x)| x)
-                    .collect::<Vec<_>>();
+                };
 
                 if let Occluder2dShape::RoundRectangle {
                     half_width,
@@ -471,7 +489,7 @@ pub(crate) fn prepare_data(
                     let light_inside_occluder = closest == light_pos;
 
                     push_vertices(
-                        bins,
+                        &mut add,
                         &vertices,
                         light.pos,
                         light.core.radius,
@@ -507,7 +525,7 @@ pub(crate) fn prepare_data(
                     let closest = occluder.aabb.closest_point(light.pos);
 
                     push_vertices(
-                        bins,
+                        &mut add,
                         &vertices,
                         light.pos,
                         light.core.radius,
@@ -604,7 +622,7 @@ struct Vertex {
 }
 
 fn push_vertices(
-    mut bins: Vec<&mut BinBuffer>,
+    add: &mut impl FnMut(&OccluderData),
     occluder_vertices: &[Vec2],
     light_pos: Vec2,
     light_radius: f32,
@@ -622,16 +640,14 @@ fn push_vertices(
     };
 
     if !poly && rev {
-        bins.iter_mut().for_each(|bins| {
-            bins.add_occluder(&OccluderData {
-                pointer: OccluderPointer {
-                    index,
-                    distance,
-                    ..default()
-                },
-                min_angle: 0.0,
-                angle: TAU,
-            })
+        add(&OccluderData {
+            pointer: OccluderPointer {
+                index,
+                distance,
+                ..default()
+            },
+            min_angle: 0.0,
+            angle: TAU,
         });
         return;
     }
@@ -743,9 +759,7 @@ fn push_vertices(
                         angle: slice.angle + angle_left + angle_right,
                     };
 
-                    bins.iter_mut().for_each(|bins| {
-                        bins.add_occluder(&data);
-                    });
+                    add(&data);
                 }
                 Some(split) => {
                     let data1 = OccluderData {
@@ -772,10 +786,8 @@ fn push_vertices(
                         angle: slice.angle + angle_left + angle_right,
                     };
 
-                    bins.iter_mut().for_each(|bins| {
-                        bins.add_occluder(&data1);
-                        bins.add_occluder(&data2);
-                    });
+                    add(&data1);
+                    add(&data2);
                 }
             }
         }
